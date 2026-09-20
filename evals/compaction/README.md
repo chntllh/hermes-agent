@@ -81,6 +81,26 @@ pinned tail, state/request ceilings). When the fitted state cannot get under
 the 25K-token ceiling the arm records `jev_fallback` (the plugin throws and
 Claude Code falls back to its built-in summary) instead of scoring.
 
+A policy with `"engine": "jev_assist"` is the hybrid experiment. It asks Jev
+to rank a bounded set of old tool-result anchors, injects only those excerpts
+as data into the existing Hermes summary prompt, and then runs the normal
+structured `ContextCompressor`. Jev never deletes transcript rows in this arm;
+Jev failure falls back to the unchanged summary path. Run it beside the
+shipping path with:
+
+```bash
+python evals/compaction/runner.py \
+  --transcript /path/to/lineage.json \
+  --policies current+recovery,jev_assist+recovery \
+  --questions 15 \
+  --out evals/compaction/results/jev-assist-run
+```
+
+The result records both summary and Jev spend, anchor count, anchor size,
+Jev failures, retained tokens, recall, and compaction latency. The arm is
+eval-only until it beats `current+recovery` on recall at lower retained
+context without increasing safety or recovery failures.
+
 Every arm's result carries its compaction spend: `compaction_calls`,
 `compaction_input_tokens` / `compaction_output_tokens`, `compaction_model`
 and `compaction_cost_usd` (Jev reports cost directly; summary calls are

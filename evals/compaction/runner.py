@@ -317,6 +317,30 @@ def _compress_with_policy(spec: dict, messages) -> tuple:
         }
         return compressed, comp, cost
 
+    if spec.get("engine") == "jev_assist":
+        from evals.compaction.jev_assist_arm import JevAssistCompactor
+        from evals.compaction.jev_arm import JevOptions
+
+        comp = JevAssistCompactor(
+            jev_options=JevOptions(**(spec.get("jev") or {})),
+            **(spec.get("assist") or {}),
+        )
+        with _AuxMeter() as meter:
+            compressed = comp.compress(
+                copy.deepcopy(messages),
+                current_tokens=total_tokens(messages),
+                force=True,
+            )
+        cost = meter.summary()
+        cost.update({
+            "jev_assist": comp.stats,
+            "compaction_calls": cost["compaction_calls"] + comp.jev.usage.requests,
+            "compaction_input_tokens": cost["compaction_input_tokens"] + comp.jev.usage.input_tokens,
+            "compaction_output_tokens": cost["compaction_output_tokens"] + comp.jev.usage.output_tokens,
+            "compaction_cost_usd": (cost["compaction_cost_usd"] or 0.0) + comp.jev.usage.cost_usd,
+        })
+        return compressed, comp, cost
+
     from agent.context_compressor import ContextCompressor
 
     comp = apply_policy(ContextCompressor(model=EVAL_MODEL, quiet_mode=True), spec)

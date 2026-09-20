@@ -76,6 +76,13 @@ POLICIES: Dict[str, Dict[str, Any]] = {
         "engine": "jev",
         "jev": {"select": "recency", "result_budget_tokens": 60_000},
     },
+    # Hybrid experiment: Jev selects bounded historical tool-result anchors,
+    # then Hermes' existing structured summary performs the actual compaction.
+    "jev_assist": {
+        "engine": "jev_assist",
+        "jev": {"preserve_recent_messages": 40, "result_budget_tokens": 16_000},
+        "assist": {"max_anchor_chars": 12_000, "max_anchors": 24},
+    },
 }
 
 
