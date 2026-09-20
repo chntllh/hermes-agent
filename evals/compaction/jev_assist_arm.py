@@ -108,7 +108,9 @@ class JevAssistCompactor:
             )
             anchors = self._anchor_text(original, calls, self.jev.decisions, self.max_anchors)
         except Exception as exc:  # summary remains the safe fallback
-            self._last_jev_error = str(exc)
+            self._last_jev_error = (
+                f"{self._last_jev_error}; {exc}" if self._last_jev_error else str(exc)
+            )
             anchors = ""
 
         combined_memory = memory_context.strip()
