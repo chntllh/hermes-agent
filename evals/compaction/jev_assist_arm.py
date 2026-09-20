@@ -41,19 +41,31 @@ class JevAssistCompactor:
         max_anchors: int = 24,
     ) -> None:
         self.summary = ContextCompressor(
-            model="anthropic/claude-fable-5",
+            model="gpt-5.6-luna",
             quiet_mode=True,
             **(summary_kwargs or {}),
         )
         options = copy.deepcopy(jev_options or JevOptions())
         options.select = "jev"
         options.result_budget_tokens = options.result_budget_tokens or 16_000
-        self.jev = JevCompactor(asker=asker, options=options)
+        self._last_jev_error: Optional[str] = None
+        if asker is None:
+            try:
+                self.jev = JevCompactor(options=options)
+            except RuntimeError as exc:
+                # Keep the hybrid arm runnable without a Jev credential. The
+                # summary path remains the authoritative fallback.
+                self._last_jev_error = str(exc)
+                self.jev = JevCompactor(
+                    asker=lambda _state, _questions, error=exc: (_ for _ in ()).throw(error),
+                    options=options,
+                )
+        else:
+            self.jev = JevCompactor(asker=asker, options=options)
         self.max_anchor_chars = max_anchor_chars
         self.max_anchors = max_anchors
         self.stats: Dict[str, Any] = {}
         self._last_summary_error: Optional[str] = None
-        self._last_jev_error: Optional[str] = None
 
     @staticmethod
     def _anchor_text(messages: List[Dict[str, Any]], calls: List[ToolCall], decisions: list, max_anchors: int) -> str:

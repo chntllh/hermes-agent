@@ -12,9 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-# Window we evaluate against (fable-5 class model).
-EVAL_MODEL = "anthropic/claude-fable-5"
-EVAL_WINDOW = 1_000_000
+# Match the active Hermes profile used for this evaluation run.
+EVAL_MODEL = "gpt-5.6-luna"
 
 POLICIES: Dict[str, Dict[str, Any]] = {
     # Shipping behavior, untouched.
