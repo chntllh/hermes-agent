@@ -70,6 +70,10 @@ def _pending_files(subsystem: str) -> list:
     return list(d.glob("*.json")) if d.exists() else []
 
 
+def _archived_pending_path(subsystem: str, pending_id: str) -> Path:
+    return get_hermes_home() / "archive" / "pending" / subsystem / f"{pending_id}.json"
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
@@ -114,15 +118,33 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def discard_pending(subsystem: str, pending_id: str) -> bool:
-    """Delete a pending record. Returns True if it existed."""
+def discard_pending(subsystem: str, pending_id: str, *, outcome: str = "discarded") -> bool:
+    """Archive and delete a pending record. Returns True only after both succeed.
+
+    Pending writes may contain useful memory proposals even when rejected; preserving the
+    exact record before deletion lets the vault sync back them up for later recovery.
+    """
     try:
         path = _pending_path(subsystem, pending_id)
-        if path.exists():
-            path.unlink()
-            return True
+        if not path.exists():
+            return False
+        try:
+            record: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("pending record is not an object")
+        except Exception:
+            record = {
+                "id": pending_id,
+                "subsystem": subsystem,
+                "raw_record": path.read_text(encoding="utf-8", errors="replace"),
+            }
+        record["resolution"] = outcome
+        record["resolved_at"] = time.time()
+        atomic_json_write(_archived_pending_path(subsystem, pending_id), record)
+        path.unlink()
+        return True
     except Exception as e:  # pragma: no cover
-        logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
+        logger.error("Failed to archive/discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
 
 

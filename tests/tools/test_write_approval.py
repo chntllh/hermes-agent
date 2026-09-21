@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -59,6 +60,23 @@ def test_list_pending_skips_non_dict_record(hermes_home):
     assert len(records) == 1 and records[0]["payload"]["content"] == "ok"
     assert wa.get_pending("memory", "bad") is None
 
+
+def test_discard_pending_archives_resolution(hermes_home):
+    """Approved/rejected staged writes remain recoverable before deletion."""
+    from tools import write_approval as wa
+
+    record = wa.stage_write(
+        "memory", {"action": "add", "target": "user", "content": "recover me"},
+        summary="recover me", origin="background_review",
+    )
+    assert wa.discard_pending("memory", record["id"], outcome="rejected") is True
+    assert wa.pending_count("memory") == 0
+
+    archived = Path(hermes_home) / "archive" / "pending" / "memory" / f"{record['id']}.json"
+    saved = json.loads(archived.read_text(encoding="utf-8"))
+    assert saved["id"] == record["id"]
+    assert saved["resolution"] == "rejected"
+    assert saved["payload"]["content"] == "recover me"
 
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa
@@ -186,6 +204,7 @@ def test_handle_approve_all(hermes_home):
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 2" in out
     assert wa.pending_count("memory") == 0
+    assert sorted(p.name for p in (Path(hermes_home) / "archive" / "pending" / "memory").glob("*.json"))
     assert len(store.user_entries) == 2
 
 

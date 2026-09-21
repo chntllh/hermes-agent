@@ -292,6 +292,13 @@ This is the answer to "the agent saved a wrong assumption about me": set
 `write_approval: true`, and every save — especially the unprompted background
 ones — waits for your yes/no before it ever enters your profile.
 
+Pending writes are recoverable even when they are not approved: the live queue is
+snapshotted by `hermes-vault/sync.sh`, and approving, rejecting, or otherwise
+discarding a record archives it under `~/.hermes/archive/pending/` before deletion.
+The vault keeps unresolved and resolved records separately under
+`backups/pending-writes/live/` and `backups/pending-writes/resolved/`; neither is
+automatically restored into the active queue.
+
 ## Background review notifications (`display.memory_notifications`)
 
 After a turn, the background self-improvement review may quietly save a memory
