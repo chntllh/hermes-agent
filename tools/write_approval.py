@@ -38,6 +38,20 @@ _SUBSYSTEMS = (MEMORY, SKILLS)
 # state — to disable a subsystem use its own enable flag (e.g. ``memory.memory_enabled``).
 CONFIG_KEY = "write_approval"
 _TRUTHY_STRINGS = frozenset({"on", "true", "yes", "1", "approve", "enabled"})
+_PENDING_ID_RE = re.compile(r"[0-9a-f]{8}")
+
+
+def _valid_pending_id(pending_id: Any) -> bool:
+    return isinstance(pending_id, str) and _PENDING_ID_RE.fullmatch(pending_id) is not None
+
+
+def _valid_subsystem(subsystem: Any) -> bool:
+    return subsystem in _SUBSYSTEMS
+
+
+def _record_matches_location(record: Any, subsystem: str, pending_id: str) -> bool:
+    return (isinstance(record, dict) and record.get("id") == pending_id
+            and record.get("subsystem") == subsystem)
 
 
 # --- Config resolution ---
@@ -64,15 +78,23 @@ def _normalize_enabled(value: Any) -> bool:
 # --- Pending store (file-backed) ---
 
 def _pending_path(subsystem: str, pending_id: str) -> Path:
+    if not _valid_subsystem(subsystem):
+        raise ValueError(f"invalid pending subsystem: {subsystem!r}")
+    if pending_id and not _valid_pending_id(pending_id):
+        raise ValueError(f"invalid pending id: {pending_id!r}")
     return get_hermes_home() / "pending" / subsystem / f"{pending_id}.json"
 
 
 def _pending_files(subsystem: str) -> list:
+    if not _valid_subsystem(subsystem):
+        return []
     d = _pending_path(subsystem, "").parent
     return list(d.glob("*.json")) if d.exists() else []
 
 
 def _archived_pending_path(subsystem: str, pending_id: str) -> Path:
+    if not _valid_subsystem(subsystem) or not _valid_pending_id(pending_id):
+        raise ValueError("invalid archived pending location")
     return get_hermes_home() / "archive" / "pending" / subsystem / f"{pending_id}.json"
 
 
@@ -95,6 +117,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
     Persistence is fail-closed: callers never receive an ID for a record that was not durably written."""
+    if not _valid_subsystem(subsystem):
+        raise ValueError(f"invalid pending subsystem: {subsystem!r}")
     pid = uuid.uuid4().hex[:8]
     record: Dict[str, Any] = {
         "schema_version": 2,
@@ -106,7 +130,7 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     if subsystem == MEMORY:
         record["base"] = _memory_projection_state(payload)
     try:
-        atomic_json_write(_pending_path(subsystem, pid), record)
+        atomic_json_write(_pending_path(subsystem, pid), record, fsync_dir=True)
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
         raise RuntimeError(f"Could not persist pending {subsystem} write: {e}") from e
@@ -114,68 +138,78 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
 
 
 def validate_pending_base(record: Dict[str, Any]) -> tuple[bool, str]:
-    """Compare-and-swap fence for schema-v2 memory proposals.
+    """Validate the revision fence shape before replaying a memory proposal.
 
-    Legacy records have no base revision and retain their existing exact-match validation.
+    Schema-v2 records must carry a well-formed target/hash fence. True legacy
+    records predate ``schema_version`` and keep their original replay behavior.
+    The actual hash comparison happens inside MemoryStore's locked transaction.
     """
-    if record.get("subsystem") != MEMORY or not isinstance(record.get("base"), dict):
+    if record.get("subsystem") != MEMORY:
         return True, ""
-    expected = record["base"]
-    current = _memory_projection_state(record.get("payload") or {})
-    if expected.get("target") == current["target"] and expected.get("sha256") == current["sha256"]:
+    version = record.get("schema_version")
+    if version is None:
         return True, ""
-    return False, (
-        "base revision changed; proposal was left pending for re-review "
-        f"(expected {expected.get('sha256', 'unknown')}, current {current['sha256']})"
-    )
+    if type(version) is not int or version != 2:
+        return False, f"unsupported pending memory schema version {version!r}; proposal was left pending"
+    base, payload = record.get("base"), record.get("payload")
+    target = payload.get("target", "memory") if isinstance(payload, dict) else None
+    if (not isinstance(base, dict) or base.get("target") != target or target not in {"memory", "user"}
+            or not isinstance(base.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", base["sha256"])):
+        return False, "missing or malformed schema-v2 base revision; proposal was left pending for safety"
+    return True, ""
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
-    """Return all pending records for ``subsystem``, oldest first."""
+    """Return all well-formed pending records for ``subsystem``, oldest first."""
+    if not _valid_subsystem(subsystem):
+        return []
     records: List[Dict[str, Any]] = []
     for p in _pending_files(subsystem):
         try:
+            pending_id = p.stem
+            if not _valid_pending_id(pending_id):
+                raise ValueError("invalid filename id")
             record = json.loads(p.read_text(encoding="utf-8"))
-            if not isinstance(record, dict):
-                raise ValueError(f"expected a JSON object, got {type(record).__name__}")
+            if not _record_matches_location(record, subsystem, pending_id):
+                raise ValueError("record id/subsystem does not match its pending location")
             records.append(record)
         except Exception:
-            logger.warning("Skipping unreadable pending record: %s", p)
+            logger.warning("Skipping unreadable or inconsistent pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
     return records
 
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
-    """Return a single pending record by id, or None."""
+    """Return a single location-consistent pending record by id, or None."""
+    if not _valid_subsystem(subsystem) or not _valid_pending_id(pending_id):
+        return None
     path = _pending_path(subsystem, pending_id)
     if not path.exists():
         return None
     with suppress(Exception):
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
+        return data if _record_matches_location(data, subsystem, pending_id) else None
     return None
 
 
 def discard_pending(subsystem: str, pending_id: str, *, outcome: str = "discarded") -> bool:
-    """Archive and delete a pending record. Returns True only after both succeed.
+    """Archive and delete a location-consistent pending record. Returns True only after both succeed.
 
     Pending writes may contain useful memory proposals even when rejected; preserving the
     exact record before deletion lets the vault sync back them up for later recovery.
     """
+    if not _valid_subsystem(subsystem) or not _valid_pending_id(pending_id):
+        return False
     try:
         path = _pending_path(subsystem, pending_id)
         if not path.exists():
             return False
         try:
             record: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(record, dict):
-                raise ValueError("pending record is not an object")
+            if not _record_matches_location(record, subsystem, pending_id):
+                raise ValueError("pending record does not match its location")
         except Exception:
-            record = {
-                "id": pending_id,
-                "subsystem": subsystem,
-                "raw_record": path.read_text(encoding="utf-8", errors="replace"),
-            }
+            return False
         record["resolution"] = outcome
         record["resolved_at"] = time.time()
         atomic_json_write(_archived_pending_path(subsystem, pending_id), record)
@@ -188,6 +222,8 @@ def discard_pending(subsystem: str, pending_id: str, *, outcome: str = "discarde
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
+    if not _valid_subsystem(subsystem):
+        return 0
     d = _pending_path(subsystem, "").parent
     if not d.exists():
         return 0

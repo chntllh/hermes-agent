@@ -283,10 +283,14 @@ Review staged writes from the CLI or any messaging platform:
 
 ```
 /memory pending             # list staged memory writes (auto ones tagged [auto])
-/memory approve <id>        # apply one (or 'all')
+/memory approve <id>        # apply one reviewed proposal (memory does not support approve-all for fenced queues)
 /memory reject <id>         # drop one (or 'all')
 /memory approval on         # turn the gate on (or 'off') and persist it
 ```
+
+`/memory approve all` is refused when more than one revision-fenced proposal is pending:
+approving sequentially can make later proposals stale and leave a partial queue. Review and
+approve each proposal by ID (or consolidate the facts into one newly staged batch) instead.
 
 This is the answer to "the agent saved a wrong assumption about me": set
 `write_approval: true`, and every save — especially the unprompted background

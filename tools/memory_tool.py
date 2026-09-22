@@ -246,17 +246,28 @@ def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str
     return {"success": False, "error": f"Built-in {label} writes are disabled in memory config.", "target": target}
 
 
-def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
-    """Replay a staged write against the store, bypassing the gate (/memory approve)."""
+def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore", *,
+                         base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Replay a staged write against the store, bypassing the gate (/memory approve).
+
+    A schema-v2 ``base`` is forwarded into MemoryStore so its byte hash is checked
+    while that store holds the target's read-modify-write file lock.
+    """
     action, target = payload.get("action"), payload.get("target", "memory")
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return target_error
+    expected_base_sha256 = base.get("sha256") if base else None
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        return store.apply_batch(target, payload.get("operations") or [], expected_base_sha256=expected_base_sha256)
     if action not in _STORE_ACTIONS:
         return {"success": False, "error": f"Unknown staged action '{action}'."}
-    return _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "")
+    if action == "add":
+        return store.add(target, payload.get("content") or "", expected_base_sha256=expected_base_sha256)
+    if action == "replace":
+        return store.replace(target, payload.get("old_text") or "", payload.get("content") or "",
+                             expected_base_sha256=expected_base_sha256)
+    return store.remove(target, payload.get("old_text") or "", expected_base_sha256=expected_base_sha256)
 
 
 MEMORY_SCHEMA = {

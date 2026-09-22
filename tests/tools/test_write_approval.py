@@ -11,6 +11,8 @@ import json
 import os
 import tempfile
 import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -95,6 +97,23 @@ def test_stage_write_fails_closed_when_record_cannot_persist(hermes_home, monkey
     assert wa.pending_count("memory") == 0
 
 
+def test_stage_write_fsyncs_pending_directory(hermes_home, monkeypatch):
+    """A returned pending ID must survive a crash after the atomic rename."""
+    from tools import write_approval as wa
+
+    calls = []
+    real_write = wa.atomic_json_write
+
+    def tracked_write(path, record, **kwargs):
+        calls.append(kwargs)
+        return real_write(path, record, **kwargs)
+
+    monkeypatch.setattr(wa, "atomic_json_write", tracked_write)
+    wa.stage_write("memory", {"action": "add", "target": "memory", "content": "durable"},
+                   summary="durable", origin="background_review")
+    assert calls == [{"fsync_dir": True}]
+
+
 def test_approve_rejects_changed_memory_base_revision(hermes_home):
     """A proposal is compare-and-swap against the memory projection it reviewed."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
@@ -123,6 +142,126 @@ def test_approve_rejects_changed_memory_base_revision(hermes_home):
     reloaded = MemoryStore(); reloaded.load_from_disk()
     assert "proposed fact" not in reloaded.memory_entries
     assert "canonical fact" in reloaded.memory_entries
+
+def test_approve_checks_base_after_acquiring_memory_file_lock(hermes_home, monkeypatch):
+    """A writer that wins the file lock before approval must invalidate the proposal.
+
+    This deterministically places the competing write after the approval thread begins
+    but before it can acquire the MemoryStore transaction lock. The old split
+    validate-then-apply path approved the stale proposal; CAS must run inside that lock.
+    """
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", "canonical fact")["success"] is True
+    record = wa.stage_write(
+        "memory", {"action": "replace", "target": "memory", "old_text": "canonical fact", "content": "proposed fact"},
+        summary="replace canonical fact", origin="background_review",
+    )
+    path = MemoryStore._path_for("memory")
+    original_lock = MemoryStore._file_lock
+    attempting_transaction = threading.Event()
+
+    @contextmanager
+    def observed_lock(lock_path):
+        attempting_transaction.set()
+        with original_lock(lock_path):
+            yield
+
+    monkeypatch.setattr(MemoryStore, "_file_lock", staticmethod(observed_lock))
+    outcome = []
+
+    with original_lock(path):
+        thread = threading.Thread(
+            target=lambda: outcome.append(handle_pending_subcommand(
+                wa.MEMORY, ["approve", record["id"]], memory_store=store)),
+        )
+        thread.start()
+        assert attempting_transaction.wait(timeout=2), "approval never attempted the memory transaction"
+        path.write_text("canonical fact\n§\nconcurrent fact", encoding="utf-8")
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert outcome and "base revision changed" in outcome[0]
+    assert wa.pending_count("memory") == 1
+    reloaded = MemoryStore(); reloaded.load_from_disk()
+    assert reloaded.memory_entries == ["canonical fact", "concurrent fact"]
+
+
+def test_approve_does_not_report_success_when_archiving_fails(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    record = wa.stage_write("memory", {"action": "add", "target": "memory", "content": "applied but retained"},
+                            summary="archive failure", origin="background_review")
+    monkeypatch.setattr(wa, "discard_pending", lambda *_args, **_kwargs: False)
+
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", record["id"]], memory_store=store)
+    assert "Approved" not in out
+    assert "No memory writes were finalized" in out
+    assert "archive/discard failed" in out
+    assert "applied but retained" in store.memory_entries
+
+
+def test_schema_v2_missing_or_malformed_base_fails_closed_but_legacy_replays(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    for broken_base in (None, {"target": "memory", "sha256": "not-a-hash"}):
+        record = wa.stage_write("memory", {"action": "add", "target": "memory", "content": "blocked"},
+                                summary="blocked", origin="background_review")
+        path = wa._pending_path("memory", record["id"])
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if broken_base is None:
+            saved.pop("base")
+        else:
+            saved["base"] = broken_base
+        path.write_text(json.dumps(saved), encoding="utf-8")
+        out = handle_pending_subcommand(wa.MEMORY, ["approve", record["id"]], memory_store=store)
+        assert "missing or malformed schema-v2 base revision" in out
+        assert wa.get_pending("memory", record["id"]) is not None
+
+    legacy_id = "abcdef12"
+    legacy = {"id": legacy_id, "subsystem": "memory", "payload": {
+        "action": "add", "target": "memory", "content": "legacy remains compatible"}}
+    legacy_path = wa._pending_path("memory", legacy_id)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", legacy_id], memory_store=store)
+    assert "Approved 1 memory write" in out
+    assert "legacy remains compatible" in store.memory_entries
+
+
+def test_pending_id_and_record_identity_are_strict(hermes_home):
+    from tools import write_approval as wa
+
+    record = wa.stage_write("memory", {"action": "add", "target": "memory", "content": "identity"},
+                            summary="identity", origin="background_review")
+    path = wa._pending_path("memory", record["id"])
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["id"] = "deadbeef"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+    assert wa.list_pending("memory") == []
+    assert wa.get_pending("memory", record["id"]) is None
+    assert wa.discard_pending("memory", record["id"]) is False
+    assert wa.get_pending("memory", "../../config") is None
+
+    skill = wa.stage_write("skills", {"action": "delete", "name": "demo"},
+                           summary="wrong subsystem", origin="background_review")
+    skill_path = wa._pending_path("skills", skill["id"])
+    skill_saved = json.loads(skill_path.read_text(encoding="utf-8"))
+    skill_saved["subsystem"] = "memory"
+    skill_path.write_text(json.dumps(skill_saved), encoding="utf-8")
+    assert wa.list_pending("skills") == []
+    assert wa.get_pending("skills", skill["id"]) is None
+
 
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa

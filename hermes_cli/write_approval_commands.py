@@ -82,12 +82,15 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     for rec in targets:
         ok, msg = _apply_one(subsystem, rec, memory_store)
         if ok:
-            wa.discard_pending(subsystem, rec["id"], outcome="approved")
-            applied += 1
+            if wa.discard_pending(subsystem, rec["id"], outcome="approved"):
+                applied += 1
+            else:
+                failed.append(
+                    f"{rec['id']}: write applied but archive/discard failed; it remains pending and must not be re-approved")
         else:
             failed.append(f"{rec['id']}: {msg}")
 
-    out = [f"Approved {applied} {subsystem} write(s)."]
+    out = [f"Approved {applied} {subsystem} write(s)."] if applied else [f"No {subsystem} writes were finalized."]
     if failed:
         out.append("Failed:")
         out.extend(f"  {f}" for f in failed)
@@ -104,7 +107,8 @@ def _apply_one(subsystem: str, rec, memory_store):
             if not valid:
                 return False, message
             from tools.memory_tool import apply_memory_pending
-            result = apply_memory_pending(payload, memory_store)
+            base = rec["base"] if rec.get("schema_version") == 2 else None
+            result = apply_memory_pending(payload, memory_store, base=base)
         else:
             from tools.skill_manager_tool import apply_skill_pending
             result = json.loads(apply_skill_pending(payload))

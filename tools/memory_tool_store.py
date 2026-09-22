@@ -3,6 +3,7 @@ Entries are joined by ``ENTRY_DELIMITER``; budgets are in chars (model-independe
 Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) stays
 in ``tools.memory_tool`` and is read lazily."""
 
+import hashlib
 import logging
 import os
 import time
@@ -221,17 +222,31 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message + " No operations were applied (batch is all-or-nothing).", usage=self._usage(target)))
 
-    def _mutate(self, target: str, mutate, *, skip_drift: bool = False) -> Dict[str, Any]:
+    def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
+                expected_base_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
         file) and, unless *skip_drift*, on external drift (flushing would discard
         un-roundtrippable content). Drift check and parse use the SAME raw snapshot —
-        a failed second read used to count as "no drift"."""
+        a failed second read used to count as "no drift". When ``expected_base_sha256``
+        is supplied, its compare-and-swap check uses that same locked byte snapshot."""
         path = self._path_for(target)
         with self._file_lock(path):
-            raw, read_ok = self._read_raw_checked(path)
+            raw_bytes, read_ok = self._read_raw_bytes_checked(path)
             if not read_ok:
+                return _read_failed_error(path)
+            # The approval revision fence must share this lock with the later
+            # read-modify-write. Validating before acquisition has a TOCTOU gap.
+            if expected_base_sha256 is not None:
+                current_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+                if current_sha256 != expected_base_sha256:
+                    return _error(
+                        "base revision changed; proposal was left pending for re-review "
+                        f"(expected {expected_base_sha256}, current {current_sha256})")
+            try:
+                raw = raw_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
                 return _read_failed_error(path)
             bak = None if skip_drift else self._detect_external_drift(target, raw)
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
@@ -247,7 +262,7 @@ class MemoryStore:
             self._write_file(path, result[0])
             return self._success_response(target, result[1])
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(self, target: str, content: str, *, expected_base_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -267,9 +282,10 @@ class MemoryStore:
             return entries + [content], "Entry added."
         # Append-only: skip the drift guard (appending never clobbers foreign
         # content) but still refuse a failed read — add rewrites the WHOLE file.
-        return self._mutate(target, _add, skip_drift=True)
+        return self._mutate(target, _add, skip_drift=True, expected_base_sha256=expected_base_sha256)
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(self, target: str, old_text: str, new_content: str, *,
+                expected_base_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         new_content = new_content.strip()
         if not old_text.strip():
@@ -278,15 +294,16 @@ class MemoryStore:
             return _error("new_content cannot be empty. Use 'remove' to delete entries.")
         if scan_error := _scan_memory_content(new_content):
             return _error(scan_error)
-        return self._edit(target, old_text.strip(), new_content)
+        return self._edit(target, old_text.strip(), new_content, expected_base_sha256=expected_base_sha256)
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(self, target: str, old_text: str, *, expected_base_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         if not old_text.strip():
             return _error("old_text cannot be empty.")
-        return self._edit(target, old_text.strip(), None)
+        return self._edit(target, old_text.strip(), None, expected_base_sha256=expected_base_sha256)
 
-    def _edit(self, target: str, old_text: str, new_content: Optional[str]) -> Dict[str, Any]:
+    def _edit(self, target: str, old_text: str, new_content: Optional[str], *,
+              expected_base_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Locked replace (``new_content`` set) or remove (None) of the entry matching *old_text*."""
         def _apply(entries, limit):
             idx, ambiguous = _find_unique_match(entries, old_text)
@@ -307,7 +324,7 @@ class MemoryStore:
                     f"or 'remove' other stale or less important entries to make room (see current_entries "
                     f"below), then retry — all in this turn."))
             return replaced, "Entry replaced."
-        return self._mutate(target, _apply)
+        return self._mutate(target, _apply, expected_base_sha256=expected_base_sha256)
 
     @staticmethod
     def _apply_batch_op(working: List[str], act: str, content: str, old_text: str, pos: str) -> Optional[str]:
@@ -332,7 +349,8 @@ class MemoryStore:
         working[idx:idx + 1] = [content] if act == "replace" else []
         return None
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(self, target: str, operations: List[Dict[str, Any]], *,
+                    expected_base_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure. Aborts do not
@@ -371,7 +389,7 @@ class MemoryStore:
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
                     f"entries in the same batch, then retry."))
             return working, f"Applied {len(operations)} operation(s)."
-        return self._mutate(target, _apply)
+        return self._mutate(target, _apply, expected_base_sha256=expected_base_sha256)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
@@ -403,8 +421,9 @@ class MemoryStore:
         """``(raw, read_ok)``; ``read_ok`` is False ONLY when the file EXISTS but can't be
         read. Decoding stays STRICT (``errors="replace"`` would hand callers a lossy view
         a save then persists); ``utf-8-sig`` strips a Notepad BOM off the first entry."""
-        if not path.exists():
-            return "", True
+        raw, read_ok = MemoryStore._read_raw_bytes_checked(path)
+        if not read_ok:
+            return "", False
         try:
             # utf-8-sig strips a leading UTF-8 BOM (Notepad-edited memory files on Windows) and is
             # byte-identical to utf-8 otherwise. Plain utf-8 kept U+FEFF glued to the first entry,
@@ -412,9 +431,24 @@ class MemoryStore:
             # STRICT on purpose: errors="replace" would hand read-modify-write callers a lossy view that a
             # subsequent save persists over the real bytes — the wipe class documented above. Undecodable
             # bytes must surface as read_ok=False.
-            return path.read_text(encoding="utf-8-sig"), True
-        except (OSError, UnicodeDecodeError):
+            return raw.decode("utf-8-sig"), True
+        except UnicodeDecodeError:
             return "", False
+
+    @staticmethod
+    def _read_raw_bytes_checked(path: Path) -> Tuple[bytes, bool]:
+        """``(raw_bytes, read_ok)`` for locked mutations and revision CAS checks.
+
+        Read through ``Path.read_text`` so every mutation has one strict,
+        monkeypatchable read path; re-encoding valid UTF-8 recreates the exact
+        byte projection (including a BOM decoded as U+FEFF).
+        """
+        if not path.exists():
+            return b"", True
+        try:
+            return path.read_text(encoding="utf-8").encode("utf-8"), True
+        except (OSError, UnicodeDecodeError):
+            return b"", False
 
     @staticmethod
     def _parse_entries(raw: str) -> List[str]:
