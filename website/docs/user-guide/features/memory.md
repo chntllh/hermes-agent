@@ -293,11 +293,17 @@ This is the answer to "the agent saved a wrong assumption about me": set
 ones — waits for your yes/no before it ever enters your profile.
 
 Pending writes are recoverable even when they are not approved: the live queue is
-snapshotted by `hermes-vault/sync.sh`, and approving, rejecting, or otherwise
+snapshotted by the canonical vault sync, and approving, rejecting, or otherwise
 discarding a record archives it under `~/.hermes/archive/pending/` before deletion.
-The vault keeps unresolved and resolved records separately under
-`backups/pending-writes/live/` and `backups/pending-writes/resolved/`; neither is
-automatically restored into the active queue.
+New records carry source-host/profile provenance and a base projection hash; approval
+fails closed and leaves the proposal pending when `MEMORY.md` or `USER.md` changed
+since the proposal was staged. Staging also fails explicitly if the pending JSON could
+not be durably written, so a reported pending ID always names a real record.
+
+In a multi-host vault, keep unresolved and resolved records under host namespaces
+such as `backups/pending-writes/live/<host>/` and
+`backups/pending-writes/resolved/<host>/`. Neither backup tree should be restored into
+the active queue automatically.
 
 ## Background review notifications (`display.memory_notifications`)
 

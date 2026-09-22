@@ -12,9 +12,11 @@ interactive CLI only) or **stages** the write under
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import re
+import socket
 import time
 import uuid
 from contextlib import suppress
@@ -74,22 +76,58 @@ def _archived_pending_path(subsystem: str, pending_id: str) -> Path:
     return get_hermes_home() / "archive" / "pending" / subsystem / f"{pending_id}.json"
 
 
+def _memory_projection_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Revision fence for the target projection a proposal reviewed."""
+    target = payload.get("target", "memory")
+    filename = "USER.md" if target == "user" else "MEMORY.md"
+    path = get_hermes_home() / "memories" / filename
+    raw = path.read_bytes() if path.exists() else b""
+    return {"target": target, "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _proposal_provenance() -> Dict[str, str]:
+    home = get_hermes_home()
+    profile = home.name if home.parent.name == "profiles" else "default"
+    return {"source_host": socket.gethostname(), "source_profile": profile}
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
-    Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
-    the safe failure for an approval gate (nothing silently committed)."""
+    Persistence is fail-closed: callers never receive an ID for a record that was not durably written."""
     pid = uuid.uuid4().hex[:8]
-    record = {
+    record: Dict[str, Any] = {
+        "schema_version": 2,
         "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
         "summary": (summary or "").strip(), "origin": origin or "foreground",
         "created_at": time.time(), "payload": payload,
+        "provenance": _proposal_provenance(),
     }
+    if subsystem == MEMORY:
+        record["base"] = _memory_projection_state(payload)
     try:
         atomic_json_write(_pending_path(subsystem, pid), record)
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        raise RuntimeError(f"Could not persist pending {subsystem} write: {e}") from e
     return record
+
+
+def validate_pending_base(record: Dict[str, Any]) -> tuple[bool, str]:
+    """Compare-and-swap fence for schema-v2 memory proposals.
+
+    Legacy records have no base revision and retain their existing exact-match validation.
+    """
+    if record.get("subsystem") != MEMORY or not isinstance(record.get("base"), dict):
+        return True, ""
+    expected = record["base"]
+    current = _memory_projection_state(record.get("payload") or {})
+    if expected.get("target") == current["target"] and expected.get("sha256") == current["sha256"]:
+        return True, ""
+    return False, (
+        "base revision changed; proposal was left pending for re-review "
+        f"(expected {expected.get('sha256', 'unknown')}, current {current['sha256']})"
+    )
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:

@@ -78,6 +78,52 @@ def test_discard_pending_archives_resolution(hermes_home):
     assert saved["resolution"] == "rejected"
     assert saved["payload"]["content"] == "recover me"
 
+
+def test_stage_write_fails_closed_when_record_cannot_persist(hermes_home, monkeypatch):
+    """Never report a pending ID when no durable pending record was written."""
+    from tools import write_approval as wa
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wa, "atomic_json_write", _boom)
+    with pytest.raises(RuntimeError, match="Could not persist pending memory write"):
+        wa.stage_write(
+            "memory", {"action": "add", "target": "memory", "content": "lost"},
+            summary="lost", origin="background_review",
+        )
+    assert wa.pending_count("memory") == 0
+
+
+def test_approve_rejects_changed_memory_base_revision(hermes_home):
+    """A proposal is compare-and-swap against the memory projection it reviewed."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", "canonical fact")["success"] is True
+    record = wa.stage_write(
+        "memory", {
+            "action": "replace", "target": "memory",
+            "old_text": "canonical fact", "content": "proposed fact",
+        },
+        summary="replace canonical fact", origin="background_review",
+    )
+    assert record["schema_version"] == 2
+    assert record["provenance"]["source_host"]
+    assert record["base"]["target"] == "memory"
+    assert record["base"]["sha256"]
+
+    assert store.add("memory", "concurrent fact")["success"] is True
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", record["id"]], memory_store=store)
+
+    assert out and "base revision changed" in out
+    assert wa.pending_count("memory") == 1
+    reloaded = MemoryStore(); reloaded.load_from_disk()
+    assert "proposed fact" not in reloaded.memory_entries
+    assert "canonical fact" in reloaded.memory_entries
+
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa
     # Real bools pass through.
@@ -192,7 +238,7 @@ _SKILL = (
 # ---------------------------------------------------------------------------
 
 
-def test_handle_approve_all(hermes_home):
+def test_handle_approve_all_refuses_revision_fenced_memory_queue(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools.memory_tool import MemoryStore
     from tools import write_approval as wa
@@ -202,10 +248,9 @@ def test_handle_approve_all(hermes_home):
     wa.stage_write("memory", {"action": "add", "target": "user", "content": "b"},
                    summary="b", origin="foreground")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
-    assert "Approved 2" in out
-    assert wa.pending_count("memory") == 0
-    assert sorted(p.name for p in (Path(hermes_home) / "archive" / "pending" / "memory").glob("*.json"))
-    assert len(store.user_entries) == 2
+    assert out and "Refusing approve all" in out
+    assert wa.pending_count("memory") == 2
+    assert store.user_entries == []
 
 
 def test_handle_approval_on(hermes_home):

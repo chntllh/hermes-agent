@@ -67,6 +67,10 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     if not records:
         return f"No pending {subsystem} writes."
     if target.lower() == "all":
+        if subsystem == wa.MEMORY and len(records) > 1 and any(rec.get("base") for rec in records):
+            return ("Refusing approve all for revision-fenced memory proposals: sequential approval "
+                    "could partially apply the queue. Review individually or consolidate the retained "
+                    "facts into one fresh atomic memory batch.")
         targets = list(records)
     else:
         rec = wa.get_pending(subsystem, target)
@@ -96,6 +100,9 @@ def _apply_one(subsystem: str, rec, memory_store):
         if subsystem == wa.MEMORY:
             if memory_store is None:
                 return False, "memory store unavailable"
+            valid, message = wa.validate_pending_base(rec)
+            if not valid:
+                return False, message
             from tools.memory_tool import apply_memory_pending
             result = apply_memory_pending(payload, memory_store)
         else:
