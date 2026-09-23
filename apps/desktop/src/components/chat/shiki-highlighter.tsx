@@ -8,6 +8,7 @@ import { ExpandableBlock } from '@/components/chat/expandable-block'
 // Theme constants live in shiki-config (dependency-free) so the lazy shiki
 // chunk can import them without pulling this module into the shiki bundle.
 import { SHIKI_COLOR_REPLACEMENTS } from '@/components/chat/shiki-config'
+import { ErrorBoundary } from '@/components/error-boundary'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
 import { isLikelyProseCodeBlock } from '@/lib/markdown-code'
@@ -55,11 +56,17 @@ const ShikiBlock = lazy(() => import('./shiki-block'))
 
 /** Suspends on first use and renders the code as plain preformatted text
  *  until the shiki chunk arrives. Highlighted output is cached by
- *  (theme, language, code), so revisits never re-tokenize (#95595). */
+ *  (theme, language, code), so revisits never re-tokenize (#95595).
+ *
+ *  A rejected dynamic import (e.g. background app update / rebuild with new
+ *  chunk hashes) throws past Suspense. The local boundary keeps the error from
+ *  bubbling to the markdown root and degrading the whole message to plain text. */
 export const LazyShiki: FC<CachedShikiBlockProps> = ({ language, code, theme, colorReplacements }) => (
-  <Suspense fallback={<PlainShiki code={code} />}>
-    <ShikiBlock code={code} colorReplacements={colorReplacements} language={language} theme={theme} />
-  </Suspense>
+  <ErrorBoundary fallback={() => <PlainShiki code={code} />} label="shiki-block">
+    <Suspense fallback={<PlainShiki code={code} />}>
+      <ShikiBlock code={code} colorReplacements={colorReplacements} language={language} theme={theme} />
+    </Suspense>
+  </ErrorBoundary>
 )
 
 export function exceedsHighlightBudget(code: string): boolean {
