@@ -83,13 +83,18 @@ function useCodePlugin(): CodePlugin | null {
 
     let cancelled = false
 
-    void import('@streamdown/code').then(({ code }) => {
-      codePluginCache = code
+    void import('@streamdown/code')
+      .then(({ code }) => {
+        codePluginCache = code
 
-      if (!cancelled) {
-        setPlugin(code)
-      }
-    })
+        if (!cancelled) {
+          setPlugin(code)
+        }
+      })
+      .catch(() => {
+        // Chunk failed to load — leave code plugin null so SyntaxHighlighter
+        // fallback handles code blocks without throwing.
+      })
 
     return () => {
       cancelled = true

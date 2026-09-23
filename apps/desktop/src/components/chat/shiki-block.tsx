@@ -45,7 +45,7 @@ export interface CachedShikiBlockProps {
 }
 
 function isLoadableLanguage(language: string): boolean {
-  return language === 'text' || language in bundledLanguages
+  return language === 'text' || Object.hasOwn(bundledLanguages, language)
 }
 
 /**
@@ -82,12 +82,17 @@ async function highlightToHtml(
       langs: isLoadableLanguage(language) ? [language as BundledLanguage] : [],
       themes: [SHIKI_THEME.dark, SHIKI_THEME.light],
       engine: createOnigurumaEngine(import('shiki/wasm'))
+    }).catch(error => {
+      highlighterPromise = null
+      throw error
     })
   }
 
   const highlighter = await highlighterPromise
 
-  if (isLoadableLanguage(language) && !highlighter.getLoadedLanguages().includes(language)) {
+  const loadable = isLoadableLanguage(language)
+
+  if (loadable && !highlighter.getLoadedLanguages().includes(language)) {
     await highlighter.loadLanguage(language as BundledLanguage)
   }
 
@@ -99,7 +104,7 @@ async function highlightToHtml(
   }
 
   return highlighter.codeToHtml(code, {
-    lang: language,
+    lang: loadable ? language : 'text',
     themes: { dark: theme.dark, light: theme.light },
     defaultColor: 'light-dark()',
     colorReplacements
