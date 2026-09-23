@@ -217,22 +217,43 @@ async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage:
 // #82285): the session's stamped owner wins, and an unstamped/uncached id —
 // a brand-new subagent child — inherits the profile the user is looking at
 // (#82768, #61286).
-export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
+// `connectionId` targets a remote gateway connection when the session belongs
+// to one, preserving remote routing across secondary window spawns (#120213).
+export async function openSessionInNewWindow(
+  sessionId: string,
+  opts?: { profile?: string; connectionId?: string; watch?: boolean }
+): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }
 
   // Lazy imports: `./profile` subscribes to the API client on load, so a
   // static import here would drag it into every page that opens windows.
-  const [{ $activeGatewayProfile, normalizeProfileKey }, { $sessions, rememberedSessionProfile }] = await Promise.all([
-    import('./profile'),
-    import('./session')
-  ])
+  const [
+    { $activeGatewayProfile, normalizeProfileKey },
+    { $sessions, knownSessionOwner, rememberedSessionProfile },
+    { $activeConnectionId }
+  ] = await Promise.all([import('./profile'), import('./session'), import('./connections')])
 
-  const profile = normalizeProfileKey(rememberedSessionProfile($sessions.get(), sessionId, $activeGatewayProfile.get()))
+  const profile = opts?.profile
+    ? normalizeProfileKey(opts.profile)
+    : normalizeProfileKey(rememberedSessionProfile($sessions.get(), sessionId, $activeGatewayProfile.get()))
+
+  const owner = knownSessionOwner($sessions.get(), sessionId)
+  const sessionConnectionId = typeof owner === 'object' && owner?.connectionId ? owner.connectionId : null
+  const rawConnectionId = opts?.connectionId ?? sessionConnectionId ?? $activeConnectionId.get() ?? undefined
+
+  const connectionId =
+    typeof rawConnectionId === 'string' && rawConnectionId.trim() ? rawConnectionId.trim() : undefined
+
+  const options: { connectionId?: string; profile: string; watch?: boolean } = {
+    profile,
+    ...(opts?.watch !== undefined ? { watch: opts.watch } : {}),
+    ...(connectionId ? { connectionId } : {})
+  }
 
   await runWindowOpen(
-    () => window.hermesDesktop.openSessionWindow(sessionId, { ...opts, profile }),
+    () => window.hermesDesktop.openSessionWindow(sessionId, options),
     'Could not open chat in a new window'
   )
 }

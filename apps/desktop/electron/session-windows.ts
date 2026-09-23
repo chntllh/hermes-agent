@@ -59,6 +59,14 @@ function chatWindowWebPreferences(preloadPath: string) {
   }
 }
 
+interface SessionWindowOptions {
+  connectionId?: null | string
+  devServer?: string
+  profile?: null | string
+  rendererIndexPath?: string
+  watch?: boolean
+}
+
 // Build the renderer URL for a secondary window. The renderer uses a
 // HashRouter, so the session route lives after the '#'. The `?win=secondary`
 // flag MUST sit in the query string BEFORE the '#': anything after the '#' is
@@ -71,9 +79,15 @@ function chatWindowWebPreferences(preloadPath: string) {
 // HUD's buildHudWindowUrl): without it a pop-out/watch window adopts the
 // PRIMARY profile and resolves the session id against the wrong backend
 // (#82768, #61286). Absent → unchanged primary adoption.
-function buildSessionWindowUrl(sessionId: string, { devServer, profile, rendererIndexPath, watch }: any = {}) {
+// `connectionId` targets a remote gateway connection when the session was
+// started on one, avoiding silent fallback to localhost (#120213).
+function buildSessionWindowUrl(
+  sessionId: string,
+  { connectionId, devServer, profile, rendererIndexPath, watch }: SessionWindowOptions = {}
+) {
   const profileKey = typeof profile === 'string' ? profile.trim() : ''
-  const query = `?win=secondary${watch ? '&watch=1' : ''}${profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''}`
+  const connectionKey = typeof connectionId === 'string' ? connectionId.trim() : ''
+  const query = `?win=secondary${watch ? '&watch=1' : ''}${profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''}${connectionKey ? `&connectionId=${encodeURIComponent(connectionKey)}` : ''}`
   const route = `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {
@@ -211,5 +225,6 @@ export {
   createSessionWindowRegistry,
   instanceWindowBounds,
   SESSION_WINDOW_MIN_HEIGHT,
-  SESSION_WINDOW_MIN_WIDTH
+  SESSION_WINDOW_MIN_WIDTH,
+  type SessionWindowOptions
 }

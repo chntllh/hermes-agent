@@ -3,6 +3,7 @@ import { createContext, useContext } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { $activeConnectionId } from '@/store/connections'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -45,6 +46,8 @@ export interface SessionView {
   kind: 'primary' | 'tile'
   $runtimeId: ReadableAtom<string | null>
   $storedId: ReadableAtom<string | null>
+  /** Active registry connection ID for this session, null when local. */
+  $connectionId?: ReadableAtom<string | null>
   $messages: ReadableAtom<ChatMessage[]>
   $busy: ReadableAtom<boolean>
   $awaitingResponse: ReadableAtom<boolean>
@@ -99,6 +102,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   kind: 'primary',
   $awaitingResponse: primaryField<boolean>(state => state.awaitingResponse, $awaitingResponse),
   $busy: $primaryBusy,
+  $connectionId: $activeConnectionId,
   $cwd: primaryField<string>(state => state.cwd, $currentCwd),
   $fast: primaryField<boolean>(state => state.fast, $currentFastMode),
   $lastVisibleIsUser: computed($primaryMessages, lastVisibleMessageIsUser),

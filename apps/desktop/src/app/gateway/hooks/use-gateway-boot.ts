@@ -101,7 +101,7 @@ import {
   resetTileRuntimeBindings
 } from '@/store/session-states'
 import { warnIfTerminalBackendUnavailable } from '@/store/terminal-backend-warning'
-import { isPeerInstanceWindow, windowProfileOverride } from '@/store/windows'
+import { isPeerInstanceWindow, windowConnectionOverride, windowProfileOverride } from '@/store/windows'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useConnectionsRegistry } from './use-connections-registry'
@@ -640,9 +640,10 @@ export function useGatewayBoot({
     async function getWindowBackend(startup = false): Promise<HermesConnection> {
       const profile = windowProfileOverride()
       const peer = isPeerInstanceWindow()
+      const connectionId = windowConnectionOverride()
 
       const route = profile
-        ? { profile, connectionId: peer ? new URLSearchParams(window.location.search).get('connectionId') : null }
+        ? { profile, connectionId }
         : startup && !peer
           ? await desktop.profile?.getDefault?.()
           : null

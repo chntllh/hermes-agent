@@ -15,6 +15,7 @@ import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { displayModelName } from '@/lib/model-status-label'
 import { useSessionSlice } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { $activeConnectionId } from '@/store/connections'
 import { $subagentsBySession } from '@/store/subagents'
 import { openSessionInNewWindow } from '@/store/windows'
 
@@ -83,8 +84,12 @@ function DelegateRowView({ row }: { row: DelegateRow }) {
     !live && row.durationSeconds ? formatDurationSeconds(row.durationSeconds) : ''
   ].filter(Boolean)
 
+  const sessionView = useSessionView()
+  const parentConnectionId = useStore(sessionView.$connectionId ?? $activeConnectionId)
+  const connectionId = parentConnectionId?.trim() || undefined
+
   // Only a child that reported its own session id has somewhere to go.
-  const open = sessionId ? () => void openSessionInNewWindow(sessionId, { watch: true }) : undefined
+  const open = sessionId ? () => void openSessionInNewWindow(sessionId, { connectionId, watch: true }) : undefined
 
   return (
     <div

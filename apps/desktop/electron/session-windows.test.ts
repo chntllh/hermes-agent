@@ -74,6 +74,37 @@ test('buildSessionWindowUrl carries the owning profile in the query before the h
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1&profile=work#/abc123')
 })
 
+test('buildSessionWindowUrl carries connectionId in the query before the hash (#120213)', () => {
+  const url = buildSessionWindowUrl('abc123', {
+    connectionId: 'remote-rig',
+    devServer: 'http://localhost:5173',
+    profile: 'work',
+    watch: true
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1&profile=work&connectionId=remote-rig#/abc123')
+})
+
+test('buildSessionWindowUrl encodes special characters in connectionId (#120213)', () => {
+  const url = buildSessionWindowUrl('abc123', {
+    connectionId: 'remote rig/node&1',
+    devServer: 'http://localhost:5173'
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&connectionId=remote%20rig%2Fnode%261#/abc123')
+})
+
+test('buildSessionWindowUrl preserves backwards compatibility when connectionId is omitted, null, or whitespace (#120213)', () => {
+  const omitted = buildSessionWindowUrl('abc123', { devServer: 'http://localhost:5173', profile: 'work' })
+  assert.equal(omitted, 'http://localhost:5173/?win=secondary&profile=work#/abc123')
+
+  const nullId = buildSessionWindowUrl('abc123', { connectionId: null, devServer: 'http://localhost:5173' })
+  assert.equal(nullId, 'http://localhost:5173/?win=secondary#/abc123')
+
+  const emptyId = buildSessionWindowUrl('abc123', { connectionId: '   ', devServer: 'http://localhost:5173' })
+  assert.equal(emptyId, 'http://localhost:5173/?win=secondary#/abc123')
+})
+
 test('buildSessionWindowUrl encodes the session id in the hash route', () => {
   const url = buildSessionWindowUrl('a b/c', { devServer: 'http://localhost:5173' })
 

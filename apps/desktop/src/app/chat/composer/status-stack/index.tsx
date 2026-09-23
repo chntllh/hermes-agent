@@ -29,6 +29,7 @@ import {
   type StatusGroup,
   stopBackgroundProcess
 } from '@/store/composer-status'
+import { $activeConnectionId } from '@/store/connections'
 import { $freeTierRoute, $freeTierStatus, freeTierStripPending } from '@/store/free-tier'
 import { $interfaceMode, shownInMode, type Tiered } from '@/store/interface-mode'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
@@ -108,7 +109,10 @@ interface ComposerStatusStackProps {
 export function ComposerStatusStack({ onSubmit, queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
-  const storedSessionId = useStore(useSessionView().$storedId)
+  const sessionView = useSessionView()
+  const storedSessionId = useStore(sessionView.$storedId)
+  const parentConnectionId = useStore(sessionView.$connectionId ?? $activeConnectionId)
+  const connectionId = parentConnectionId?.trim() || undefined
   const interfaceMode = useStore($interfaceMode)
   const shown = useMemo(() => shownInMode(interfaceMode), [interfaceMode])
   // Hydrate always (delegate cards and session dots read the same store after
@@ -196,7 +200,7 @@ export function ComposerStatusStack({ onSubmit, queue, sessionId }: ComposerStat
   const openAgents = () => navigate(AGENTS_ROUTE)
 
   const openSubagent = (item: ComposerStatusItem) =>
-    item.sessionId ? void openSessionInNewWindow(item.sessionId, { watch: true }) : openAgents()
+    item.sessionId ? void openSessionInNewWindow(item.sessionId, { connectionId, watch: true }) : openAgents()
 
   const previewRows =
     visiblePreviews.length > 0 && sessionId

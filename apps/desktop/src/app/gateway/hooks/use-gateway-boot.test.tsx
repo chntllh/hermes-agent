@@ -487,6 +487,28 @@ describe('default-route profile adoption', () => {
     }
   })
 
+  it('connects a secondary session window to its registered gateway via connectionId (#120213)', async () => {
+    const originalUrl = window.location.href
+    window.history.replaceState(null, '', '/?win=secondary&watch=1&profile=coder&connectionId=coder-remote#/sess-1')
+
+    const desktop = {
+      ...fakeDesktop(),
+      getConnection: vi.fn(async () => ({ ...coderConn, registryScoped: true })),
+      getConnectionFor: vi.fn(async () => ({ ...coderConn, registryScoped: true })),
+      getGatewayWsUrlFor: vi.fn(async () => coderConn.wsUrl)
+    }
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    try {
+      render(<Harness />)
+      await flushAsync()
+      expect(desktop.getConnectionFor).toHaveBeenCalledWith({ connectionId: 'coder-remote', profile: 'coder' })
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
+  })
+
   it.each([null, 'coder-remote'])(
     'dials the saved startup route before an ambient sender can replace it (%s)',
     async connectionId => {

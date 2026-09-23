@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $activeGatewayProfile } from './profile'
-import { $sessions } from './session'
+import { $connection, $sessions } from './session'
 import {
   isPeerInstanceWindow,
   isProfilePinnedWindow,
@@ -92,6 +92,67 @@ describe('openSessionInNewWindow', () => {
     expect(open).toHaveBeenCalledWith('s1', { profile: 'research' })
     expect(open).toHaveBeenCalledWith('child-not-listed-yet', { profile: 'work', watch: true })
     expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('passes connectionId when specified in options (#120213)', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(open)
+    $activeGatewayProfile.set('work')
+
+    await openSessionInNewWindow('child-1', { connectionId: 'remote-rig', watch: true })
+
+    expect(open).toHaveBeenCalledWith('child-1', {
+      connectionId: 'remote-rig',
+      profile: 'work',
+      watch: true
+    })
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('preserves connectionId from session row owner when omitted from options (#120213)', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(open)
+    $sessions.set([{ connection_id: 'remote-gateway', id: 's2', profile: 'coder' } as never])
+
+    await openSessionInNewWindow('s2')
+
+    expect(open).toHaveBeenCalledWith('s2', {
+      connectionId: 'remote-gateway',
+      profile: 'coder'
+    })
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('falls back to active connectionId when row owner has no connectionId (#120213)', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(open)
+    $activeGatewayProfile.set('work')
+    $connection.set({ connectionId: 'active-rig' } as never)
+    $sessions.set([{ id: 's3', profile: 'work' } as never])
+
+    try {
+      await openSessionInNewWindow('s3')
+
+      expect(open).toHaveBeenCalledWith('s3', {
+        connectionId: 'active-rig',
+        profile: 'work'
+      })
+    } finally {
+      $connection.set(null)
+    }
+  })
+
+  it('honors explicit profile passed in options', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(open)
+    $sessions.set([{ id: 's4', profile: 'default' } as never])
+
+    await openSessionInNewWindow('s4', { connectionId: 'remote-box', profile: 'custom-profile' })
+
+    expect(open).toHaveBeenCalledWith('s4', {
+      connectionId: 'remote-box',
+      profile: 'custom-profile'
+    })
   })
 
   it('notifies on an ok:false result', async () => {
