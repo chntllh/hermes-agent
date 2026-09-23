@@ -364,10 +364,9 @@ export function upsertToolPart(
       isError:
         payload?.error !== undefined
           ? Boolean(payload.error)
-          : Boolean(
-              (prev && 'isError' in prev && prev.isError) ||
-                extractToolErrorMessage(payload?.result !== undefined ? payload.result : prevResult)
-            )
+          : payload?.result !== undefined
+            ? Boolean(extractToolErrorMessage(payload.result))
+            : Boolean(prev && 'isError' in prev && prev.isError)
     })
   } satisfies ChatMessagePart
 
@@ -871,8 +870,7 @@ export function applyStoredToolResultToParts(
   const parsedResult = parseStoredToolResult(content)
   const isError = Boolean(
     (existing && 'isError' in existing && existing.isError) ||
-      extractToolErrorMessage(parsedResult) ||
-      (parsedResult && typeof parsedResult === 'object' && (parsedResult as Record<string, unknown>).error)
+      extractToolErrorMessage(parsedResult)
   )
   next[partIndex] = {
     ...existing,
