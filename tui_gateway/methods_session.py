@@ -660,7 +660,11 @@ def _resume_locate(ctx: _Resume) -> dict | None:
     if ctx.found:
         ctx.target = ctx.found["id"]
         return None
-    if ctx.lazy and _child_run_active(ctx.target):
+    try:
+        active = _child_run_active(ctx.target, profile_home=ctx.profile_home)
+    except TypeError:
+        active = _child_run_active(ctx.target)
+    if ctx.lazy and active:
         # Fresh subagent watch window: `subagent.start` relays BEFORE the child's first DB flush. Proceed lazily
         # with empty history — the live mirror streams the turn and the row exists by upgrade time.
         ctx.found = {}
@@ -729,7 +733,11 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
                        message_count=int(session.get("resume_message_count") or payload["message_count"]))
     # A lazy watch session never owns a run loop — overlay the child-run registry.
-    if session.get("agent") is None and _child_run_active(ctx.target):
+    try:
+        active = _child_run_active(ctx.target, profile_home=ctx.profile_home)
+    except TypeError:
+        active = _child_run_active(ctx.target)
+    if session.get("agent") is None and active:
         payload.update(running=True, status="streaming")
     return _ok(ctx.rid, payload)
 
@@ -767,7 +775,10 @@ def _resume_lazy(ctx: _Resume) -> dict:
     if (reused := ctx.claim(sid, record)) is not None:
         return reused
     # A child mid-run emits no session events — liveness comes from the relay registry.
-    running = _child_run_active(ctx.target)
+    try:
+        running = _child_run_active(ctx.target, profile_home=ctx.profile_home)
+    except TypeError:
+        running = _child_run_active(ctx.target)
     # Display uses the VERBATIM child-only projection so model-invisible rows survive; repaired ``history``
     # still feeds live replay.
     display = history

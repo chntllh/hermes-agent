@@ -8,6 +8,7 @@ import json
 
 import contextlib
 import threading
+import time
 
 from .method_ctx import bind_module
 
@@ -19,30 +20,140 @@ _child_mirrors: dict[str, dict] = {}
 _child_mirrors_lock = threading.Lock()
 # Child sids with a run in flight (refreshed per relayed event, popped on complete) so a
 # lazy watch resume reports running=true during a silent long tool.
-_active_child_runs: dict[str, float] = {}
+# Keyed by (profile_home, session_key) to partition active child runs by profile and
+# prevent cross-profile mirror eavesdropping (fixes #120212).
+def _normalize_profile_home(profile_home) -> str | None:
+    return str(profile_home) if profile_home else None
+
+
+class _ActiveChildRuns(dict):
+    """Child-run liveness registry partitioned by profile: (profile_home, child_key) -> float.
+    Supports bare string keys for backwards compatibility in tests (mapped to launch profile).
+    """
+
+    def __contains__(self, key):
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str):
+            return super().__contains__((None, key)) or any(
+                isinstance(k, tuple) and k[1] == key for k in self.keys()
+            )
+        if isinstance(key, tuple) and len(key) == 2:
+            return super().__contains__((_normalize_profile_home(key[0]), key[1]))
+        return False
+
+    def __getitem__(self, key):
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if isinstance(key, tuple) and len(key) == 2:
+            return super().__getitem__((_normalize_profile_home(key[0]), key[1]))
+        if isinstance(key, str):
+            if super().__contains__((None, key)):
+                return super().__getitem__((None, key))
+            for k, v in self.items():
+                if isinstance(k, tuple) and k[1] == key:
+                    return v
+            return super().__getitem__((None, key))
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        if isinstance(key, str):
+            super().__setitem__((None, key), value)
+        elif isinstance(key, tuple) and len(key) == 2:
+            super().__setitem__((_normalize_profile_home(key[0]), key[1]), value)
+        else:
+            super().__setitem__(key, value)
+
+    def get(self, key, default=None):
+        if isinstance(key, tuple) and len(key) == 2:
+            norm_key = (_normalize_profile_home(key[0]), key[1])
+            return super().get(norm_key, default)
+        if isinstance(key, str):
+            if super().__contains__((None, key)):
+                return super().get((None, key), default)
+            for k, v in self.items():
+                if isinstance(k, tuple) and k[1] == key:
+                    return v
+        return super().get(key, default)
+
+    def pop(self, key, default=None):
+        if isinstance(key, tuple) and len(key) == 2:
+            norm_key = (_normalize_profile_home(key[0]), key[1])
+            return super().pop(norm_key, default)
+        if isinstance(key, str):
+            res = default
+            if super().__contains__((None, key)):
+                res = super().pop((None, key))
+            for k in list(self.keys()):
+                if isinstance(k, tuple) and k[1] == key:
+                    res = super().pop(k)
+            if super().__contains__(key):
+                super().pop(key, None)
+            return res
+        return super().pop(key, default)
+
+
+_active_child_runs: dict[tuple[str | None, str], float] = _ActiveChildRuns()
 # Anything quiet this long lost its completion event — don't pin "running".
 _CHILD_RUN_STALE_S = 3600.0
 _CHILD_DELTA_EVENTS = {"subagent.thinking": "reasoning.delta", "subagent.text": "message.delta",
                        "subagent.start": "message.delta"}
 
 
-def _child_run_active(child_key: str) -> bool:
-    ts = _active_child_runs.get(child_key)
+def _child_run_active(child_key: str, profile_home=None) -> bool:
+    any_profile = globals().get("_ANY_PROFILE")
+    if any_profile is not None and profile_home is any_profile:
+        for (h, k), ts in list(_active_child_runs.items()):
+            if k == child_key and (time.time() - ts) < _CHILD_RUN_STALE_S:
+                return True
+        return False
+    norm_home = _normalize_profile_home(profile_home)
+    ts = _active_child_runs.get((norm_home, child_key))
+    if ts is None and profile_home is None:
+        raw_ts = dict.get(_active_child_runs, child_key)
+        if raw_ts is not None:
+            ts = raw_ts
     return ts is not None and (time.time() - ts) < _CHILD_RUN_STALE_S
 
 
-def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+def _mirror_subagent_to_child(
+    event_type: str,
+    payload: dict,
+    parent_sid: str | None = None,
+    profile_home=None,
+) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
         return
+
+    # Determine owning session's profile home
+    if profile_home is None:
+        sessions_dict = globals().get("_sessions")
+        sessions_lock = globals().get("_sessions_lock")
+        if sessions_dict is not None and sessions_lock is not None:
+            if parent_sid:
+                with sessions_lock:
+                    parent_sess = sessions_dict.get(parent_sid)
+                if isinstance(parent_sess, dict):
+                    profile_home = parent_sess.get("profile_home")
+            elif parent_id := (payload.get("parent_id") or payload.get("parent_session_id")):
+                with sessions_lock:
+                    parent_sess = sessions_dict.get(str(parent_id))
+                if isinstance(parent_sess, dict):
+                    profile_home = parent_sess.get("profile_home")
+        if profile_home is None and "profile_home" in payload:
+            profile_home = payload.get("profile_home")
+
+    norm_home = _normalize_profile_home(profile_home)
+
     # Liveness registry first: accurate with no window open (one opened mid-run knows busy).
     if event_type == "subagent.complete":
-        _active_child_runs.pop(child_key, None)
+        _active_child_runs.pop((norm_home, child_key), None)
     else:
-        _active_child_runs[child_key] = time.time()
+        _active_child_runs[(norm_home, child_key)] = time.time()
     # Mirror only into a live watch session NOT upgraded to a full agent (an upgraded one owns
     # a real native stream). Either way drop state so a reopened window starts fresh.
-    live = _find_live_session_by_key(child_key)
+    live = _find_live_session_by_key(child_key, profile_home=profile_home)
     if live is None or live[1].get("agent") is not None:
         with _child_mirrors_lock:
             _child_mirrors.pop(child_key, None)

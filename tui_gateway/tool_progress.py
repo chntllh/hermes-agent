@@ -422,7 +422,10 @@ def _progress_subagent(sid, name, preview, kw, event_type):
     # (keyed off the child sid); on the parent it's hundreds of ignored frames, so skip it.
     if event_type != "subagent.text":
         _emit(event_type, sid, payload)
-    _mirror_subagent_to_child(event_type, payload)
+    with _sessions_lock:
+        parent_sess = _sessions.get(sid)
+    parent_home = parent_sess.get("profile_home") if isinstance(parent_sess, dict) else None
+    _mirror_subagent_to_child(event_type, payload, parent_sid=sid, profile_home=parent_home)
 
 
 # event_type -> (handler, requires): `requires` names the arg that must be truthy for the row to be
