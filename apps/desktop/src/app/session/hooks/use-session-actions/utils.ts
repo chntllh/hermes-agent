@@ -746,10 +746,10 @@ export function preserveLocalPendingTurnMessages(
       }
 
       // Arrival-ordered mid-turn corrections sit BELOW the sealed live output
-      // (#73793): a live-tail assistant row between the prompt and its
+      // (#73793): an in-flight or interim assistant row between the prompt and its
       // correction is still the same turn's run. Only a committed reply ends
       // it — that is the post-compression staleness the rule exists to catch.
-      if (candidate.role === 'assistant' && isLiveTailRow(candidate)) {
+      if (candidate.role === 'assistant' && (candidate.pending === true || candidate.interim === true)) {
         continue
       }
 
@@ -1046,7 +1046,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
       continue
     }
 
-    if (candidate.role === 'assistant' && isLiveTailRow(candidate)) {
+    if (candidate.role === 'assistant' && (candidate.pending === true || candidate.interim === true)) {
       continue
     }
 

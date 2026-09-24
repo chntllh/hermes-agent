@@ -691,6 +691,33 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(preserveLocalPendingTurnMessages(partlyHeld, previous).map(message => message.id)).toContain(reply.id)
   })
 
+  it('reproduces duplicate user message after first turn ends when second prompt is sent', () => {
+    const prompt1 = msg('user-1', 'user', 'Access my phone over adb')
+    const reply1 = msg('assistant-stream-sess1', 'assistant', 'Root Cause Analysis', {
+      pending: false,
+      interim: false,
+      persistedTurn: { complete: false, user_row_id: 75460, final_assistant_row_id: 75725, row_ids: [75460, 75725] }
+    })
+    const prompt2 = msg('user-2', 'user', 'Okay so now inside the meeting')
+
+    const previous = [
+      msg('u0', 'user', 'earlier q', { rowId: 75047 }),
+      msg('a0', 'assistant', 'earlier a', { rowId: 75459, durableComplete: true }),
+      prompt1,
+      reply1,
+      prompt2
+    ]
+
+    // Authoritative next messages from DB after compaction (contains a0, a1 with rowIds)
+    const next = [
+      msg('a0', 'assistant', 'earlier a', { rowId: 75459, durableComplete: true }),
+      msg('a1', 'assistant', 'Root Cause Analysis', { rowId: 75725, durableComplete: true })
+    ]
+
+    const result = preserveLocalPendingTurnMessages(next, previous)
+    expect(result.map(m => m.id)).toEqual(['a0', 'a1', 'user-2'])
+  })
+
   it('does not append acknowledged local history after a shifted newest page', () => {
     const previous = [
       msg('user-first', 'user', 'Original request', { timestamp: 1 }),
