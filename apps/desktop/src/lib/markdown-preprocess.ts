@@ -539,6 +539,18 @@ function normalizeDisplayMathForMarkdown(text: string): string {
   return lines.join('\n')
 }
 
+function normalizeEscapedCurrencyMath(text: string): string {
+  return text
+    // Replace `$\$<amount>$` or `$\$<amount>/\text{unit}$` with escaped currency `\$<amount>`
+    .replace(/(?<!\\)\$\\\$([0-9.,]+)(?:\/(?:\\text\{)?([a-zA-Z]+)\}?)?\$/g, (_match, amount, unit) => {
+      return unit ? `\\$${amount}/${unit}` : `\\$${amount}`
+    })
+    // Inside math spans, e.g. `$100,000 \times \$0.206 = \mathbf{\$20,600.00}$`
+    // or `$\mathbf{\$138.00 / \text{month}}$`, normalize `\$` so KaTeX does not trip
+    .replace(/\\mathbf\{\\(\$[0-9.,]+)/g, '\\mathbf{\\text{$1}}')
+    .replace(/(\s[+\-*/=]\s*)\\(\$[0-9.,]+)/g, '$1\\text{$2}')
+}
+
 function normalizeProseMath(text: string): string {
   // remark-math requires multiline display delimiters on their own lines.
   // Normalize those locally before the dependency handles inline forms;
@@ -549,7 +561,10 @@ function normalizeProseMath(text: string): string {
   // a source of the hugging form: a multi-line `\[…\]` comes out of it as
   // `$$\begin{aligned}…\end{aligned}$$`. Running afterwards catches both the
   // hugging math the model emitted and the hugging math the rewrite produced.
-  const normalized = splitHuggingDisplayMath(normalizeMathDelimiters(normalizeDisplayMathForMarkdown(text)))
+  const withCurrencyNormalized = normalizeEscapedCurrencyMath(text)
+  const normalized = splitHuggingDisplayMath(
+    normalizeMathDelimiters(normalizeDisplayMathForMarkdown(withCurrencyNormalized))
+  )
 
   return escapeCurrencyDollarsPreservingMath(normalized)
 }

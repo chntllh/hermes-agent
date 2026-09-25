@@ -392,4 +392,20 @@ describe('preprocessMarkdown', () => {
 
     expect(output).toBe('Per the paper, $\\sqrt[3]{8}$ is 2.')
   })
+
+  it('normalizes escaped currency in pseudo-math to prevent remark-math delimiter inversion', () => {
+    const input = [
+      'reduces diarization from $\\$0.146$ down to $\\$0.043/\\text{hr}$, dropping total variable cost to **$\\$0.206$ per audio-hour**.',
+      '* ASR: $\\$12,600.00$',
+      '* Storage Accumulation: $\\mathbf{\\$138.00 / \\text{month}}$.',
+      '* Variable Pipeline Cost: $100,000 \\times \\$0.206 = \\mathbf{\\$20,600.00}$'
+    ].join('\n')
+    const output = preprocessMarkdown(input)
+
+    expect(output).toContain('\\$0.146 down to \\$0.043/hr')
+    expect(output).not.toContain('$\\$0.146$')
+    expect(output).toContain('ASR: \\$12,600.00')
+    expect(output).toContain('\\mathbf{\\text{$138.00}} / \\text{month}}$.')
+    expect(output).toContain('\\mathbf{\\text{$20,600.00}}}')
+  })
 })
