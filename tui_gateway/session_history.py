@@ -149,7 +149,12 @@ def _is_display_hidden_marker(role: str | None, text: str) -> bool:
     It also removes the stored marker from the payload the desktop reconciles against, so it can no longer
     shift user-message ordinals and duplicate the optimistic prompt (#67603).
     """
-    return role == "user" and text.lstrip().startswith("[System:")
+    if role != "user":
+        return False
+    from agent.context_compressor import _INFLIGHT_TASK_REPLAY_HEADER
+
+    stripped = text.lstrip()
+    return stripped.startswith("[System:") or stripped.startswith(_INFLIGHT_TASK_REPLAY_HEADER)
 
 
 def _skill_scaffold_projection(content_text: str) -> str:

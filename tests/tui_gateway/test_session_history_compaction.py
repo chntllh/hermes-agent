@@ -190,3 +190,24 @@ class TestSessionHistoryCompactionProjection:
         import tui_gateway.session_history as sh
         assert hasattr(sh, "project_compaction_message_for_display")
         assert callable(sh.project_compaction_message_for_display)
+
+    def test_inflight_task_replay_header_is_hidden_from_display(self):
+        """Synthetic continuation rows restated after compaction for model consumption
+        must not leak into client history or shift display ordinals.
+        """
+        from agent.context_compressor import _INFLIGHT_TASK_REPLAY_HEADER
+
+        history = [
+            {"role": "user", "content": "Lets setup kanban"},
+            {"role": "assistant", "content": "Working on it..."},
+            {
+                "role": "user",
+                "content": f"{_INFLIGHT_TASK_REPLAY_HEADER}\nLets setup kanban",
+            },
+            {"role": "assistant", "content": "Done setting up kanban."},
+        ]
+        messages = server._history_to_messages(history)
+        assert len(messages) == 3
+        assert messages[0] == {"role": "user", "text": "Lets setup kanban"}
+        assert messages[1] == {"role": "assistant", "text": "Working on it..."}
+        assert messages[2] == {"role": "assistant", "text": "Done setting up kanban."}
