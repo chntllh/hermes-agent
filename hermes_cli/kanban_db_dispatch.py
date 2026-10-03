@@ -1808,14 +1808,24 @@ def review_dispatch_enabled() -> bool:
 # tick (``_memory_pressure_level``) because a static cap can't see other
 # tenants. Both fail open: non-Linux / read error → no cap / "unknown".
 
-# Assumed per-worker footprint for the derived cap; deliberately conservative
-# so the cap errs toward fewer workers on small VMs.
-MEMORY_GUARD_MB_PER_WORKER = 512
+# Per-worker footprint for the derived cap. A worker is a full Hermes agent process
+# (model client, tool runtime, usually a terminal backend); the old 512 MB figure never
+# covered one, and the 8-worker cap it produced on a 13.5 GiB host is what the Sep 13
+# systemd-oomd incident spent.
+MEMORY_GUARD_KIB_PER_WORKER = 2 * 1024 * 1024  # 2 GiB
 
-# Derived default bounds: never below 2 (smallest VM must still progress),
-# never above 8 (more fan-out must be explicit in config).
-DERIVED_MAX_IN_PROGRESS_FLOOR = 2
-DERIVED_MAX_IN_PROGRESS_CEILING = 8
+# Memory the host has already promised away, which MemTotal cannot see: the Marine
+# devbox holds 7.2 GiB across 12 rootless Podman containers permanently. Sizing from
+# MemTotal fans workers out into memory that was never free.
+CONTAINER_RESERVE_KIB = 7 * 1024 * 1024  # 7 GiB
+
+# Derived default bounds. Floor 1, not 2: on a host with no headroom left, one worker
+# making slow progress beats two racing the OOM killer.
+DERIVED_MAX_IN_PROGRESS_FLOOR = 1
+DERIVED_MAX_IN_PROGRESS_CEILING = 2
+# macOS dev hosts carry no container tenancy, but a fanless M4 thermally throttles and
+# beachballs the compositor well before memory runs out; 3 is the interactive ceiling.
+DARWIN_MAX_IN_PROGRESS_CEILING = 3
 
 
 def _system_memory_sample() -> dict:
@@ -1832,19 +1842,51 @@ def _system_memory_sample() -> dict:
         return {}
 
 
-def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
-    """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
+def _positive_kib(value: Any) -> Optional[int]:
+    """A usable KiB reading, or None. ``bool`` is rejected explicitly (it is an ``int``)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def host_max_in_progress_ceiling() -> int:
+    """Ceiling on the DERIVED cap for this host. An explicit ``kanban.max_in_progress``
+    still wins — this bounds the guess we make when the operator never set one."""
+    from hermes_platform.host.facts import os_family
+
+    return DARWIN_MAX_IN_PROGRESS_CEILING if os_family() == "darwin" else DERIVED_MAX_IN_PROGRESS_CEILING
+
+
+def derive_default_max_in_progress(
+    sample: Optional[Mapping[str, Any]] = None, *, ceiling: Optional[int] = None,
+) -> Optional[int]:
+    """Memory-derived default for ``kanban.max_in_progress`` when unset; ``None``
+    (no cap) when total memory is unknown, so the guard always fails open.
+
+    Headroom is bounded twice and the smaller bound wins:
+
+    * ``MemTotal - CONTAINER_RESERVE_KIB`` — memory this host has permanently
+      promised to other tenants. A container host's ``MemAvailable`` counts page
+      cache the containers will reclaim, so it alone is not conservative enough.
+    * ``MemAvailable`` — what is actually free right now, which catches a roomy
+      host that happens to be under live pressure.
+
+    ``ceiling`` is injected so the per-host limit is testable as data rather than by
+    pretending to be on another OS; it defaults to :func:`host_max_in_progress_ceiling`.
     """
     if sample is None:
         sample = _system_memory_sample()
-    total_kib = sample.get("mem_total_kib")
-    if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
+    total_kib = _positive_kib(sample.get("mem_total_kib"))
+    if total_kib is None:
         return None
-    workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
-    return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
+    usable_kib = max(0, total_kib - CONTAINER_RESERVE_KIB)
+    available_kib = _positive_kib(sample.get("mem_available_kib"))
+    if available_kib is not None:
+        usable_kib = min(usable_kib, available_kib)
+    workers = usable_kib // MEMORY_GUARD_KIB_PER_WORKER
+    if ceiling is None:
+        ceiling = host_max_in_progress_ceiling()
+    return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, ceiling))
 
 
 def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:

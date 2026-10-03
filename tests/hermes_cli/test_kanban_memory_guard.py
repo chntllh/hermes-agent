@@ -9,7 +9,8 @@ Covers the two safeguards added in response:
 
 1. :func:`hermes_cli.kanban_db_dispatch.derive_default_max_in_progress` /
    :func:`hermes_cli.kanban_db_dispatch.resolve_max_in_progress` — memory-derived
-   default global concurrency cap when the operator never set one.
+   default global concurrency cap when the operator never set one. The sizing
+   formula itself is covered in ``test_memory_governors.py``.
 2. The live memory-pressure guard inside ``dispatch_once`` — critical
    pressure spawns nothing; elevated pressure spawns at most one; unknown
    imposes no restriction (fail-open).
@@ -45,11 +46,12 @@ GIB = 1024 * 1024  # KiB per GiB
 # ---------------------------------------------------------------------------
 
 
-def test_derived_cap_small_vm_floors_at_two():
-    # 1 GiB VM (the incident shape): 1024 // 512 = 2 workers.
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": 1 * GIB}) == 2
-    # Even tiny VMs keep a floor of 2 so boards still make progress.
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": GIB // 4}) == 2
+def test_derived_cap_small_vm_floors_at_one():
+    # 1 GiB VM (the incident shape). The original floor of 2 budgeted 4 GiB of workers
+    # onto a 1 GiB box; one worker making slow progress beats two racing the OOM killer.
+    # Policy and arithmetic now live in tests/hermes_cli/test_memory_governors.py.
+    assert kbd.derive_default_max_in_progress({"mem_total_kib": 1 * GIB}) == 1
+    assert kbd.derive_default_max_in_progress({"mem_total_kib": GIB // 4}) == 1
 
 
 
@@ -72,10 +74,10 @@ def test_resolve_max_in_progress_explicit_config_wins(monkeypatch):
 
 
 def test_resolve_max_in_progress_derives_when_unset(monkeypatch):
-    monkeypatch.setattr(
-        kbd, "_system_memory_sample", lambda: {"mem_total_kib": 1 * GIB}
-    )
-    assert kbd.resolve_max_in_progress(None) == 2
+    sample = {"mem_total_kib": 1 * GIB}
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: sample)
+    # Contract, not a snapshot: the unset path must land on the derived value.
+    assert kbd.resolve_max_in_progress(None) == kbd.derive_default_max_in_progress(sample) == 1
 
 
 def test_resolve_max_in_progress_unset_and_unknown_memory_is_uncapped(monkeypatch):

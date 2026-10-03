@@ -61,9 +61,43 @@ def _proc_fields(path: str, wanted: Dict[str, str]) -> Dict[str, int]:
     return found
 
 
+def _psutil_memory_sample() -> Dict[str, Any]:
+    """Cross-platform memory snapshot (KiB), ``{}`` when psutil cannot answer.
+
+    The fallback for hosts with no ``/proc``. Deliberately uncached: these are live
+    readings that the dispatch governors size concurrency from, not static host facts
+    (which belong in ``hermes_platform.host``). Never raises — "unknown" is a valid
+    answer here and callers all fail open on it.
+    """
+    try:
+        import psutil
+
+        virtual = psutil.virtual_memory()
+        sample: Dict[str, Any] = {
+            "mem_total_kib": int(virtual.total) // 1024,
+            "mem_available_kib": int(virtual.available) // 1024,
+            "swap_used_kib": int(psutil.swap_memory().used) // 1024,
+        }
+    except Exception:
+        logger.debug("psutil memory sampling unavailable", exc_info=True)
+        return {}
+    try:
+        sample["rss_kib"] = int(psutil.Process().memory_info().rss) // 1024
+    except Exception:
+        logger.debug("psutil RSS sampling unavailable", exc_info=True)
+    return sample
+
+
 def sample_memory() -> Dict[str, Any]:
-    """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    """Memory snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used, ``{}`` if unknown.
+
+    The 30s heartbeat embeds it so OOM cycles are classifiable, and
+    ``kanban_db_dispatch`` sizes worker concurrency from it. ``/proc`` stays the
+    primary reader where it exists (cheap enough to run every heartbeat); hosts
+    without it fall back to psutil. Before that fallback macOS returned ``{}``, which
+    read as "memory unknown" and disabled every dispatch memory guard on the M4 host.
+    Never raises.
+    """
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
     mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
                                          "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
@@ -71,6 +105,10 @@ def sample_memory() -> Dict[str, Any]:
     sample.update(mem)
     if swap_total is not None and swap_free is not None:
         sample["swap_used_kib"] = swap_total - swap_free
+    if "mem_total_kib" not in sample:
+        # setdefault, not update: a partial /proc read keeps its own (authoritative) fields.
+        for key, value in _psutil_memory_sample().items():
+            sample.setdefault(key, value)
     return sample
 
 
