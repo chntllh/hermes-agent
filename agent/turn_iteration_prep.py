@@ -337,6 +337,7 @@ def begin_iteration(
     """Iteration entry in the original order: apply a pending redirect, reset the checkpoint
     dedup, then the interrupt / review-budget / iteration-budget exits. ``api_call_count`` is
     incremented here (the grace call consumes its flag instead of the budget)."""
+    from agent.circuit_breakers import session_breaker_trip
     from agent.conversation_loop import (
         _apply_active_turn_redirect, _review_input_budget_exhausted
     )
@@ -378,6 +379,17 @@ def begin_iteration(
                 f"({int(agent.session_input_tokens):,} tokens) — stopping "
                 f"the review tool loop before the next provider call.", diagnostic=True,
             )
+        return _verdict("break")
+
+    # Session runaway breakers (spend / turns / wall clock) sit here, before the counter
+    # increments, so a tripped session never pays for the crossing request. Session-scoped
+    # on purpose: the per-turn tool guardrails reset at every turn boundary, which is
+    # exactly how multi-hour polling sessions stayed invisible to them.
+    _trip = session_breaker_trip(agent)
+    if _trip is not None:
+        _turn_exit_reason = f"halted_budget_tripwire({_trip.code})"
+        if not agent.quiet_mode:
+            agent._safe_print(f"\n\u26d4 {_trip.message}", diagnostic=True)
         return _verdict("break")
 
     api_call_count += 1

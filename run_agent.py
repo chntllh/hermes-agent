@@ -161,6 +161,7 @@ from agent.codex_responses_adapter import (
     _split_responses_tool_id as _codex_split_responses_tool_id,
     _summarize_user_message_for_log,
 )
+from agent.circuit_breakers import observe_tool_command
 from agent.tool_guardrails import ToolGuardrailDecision, append_toolguard_guidance, toolguard_synthetic_result
 from hermes_cli.observability.shared_metrics_harness import record_guardrail_decision, record_guardrail_warnings
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens
@@ -1317,6 +1318,12 @@ class AIAgent(
                 self._set_tool_guardrail_halt(streak_halt)
         if stall_notice:
             function_result = (function_result or "") + "\n\n" + stall_notice
+        # Session-scoped polling-loop steering. The guards above reset each turn and only
+        # fire on byte-identical results, so a `tmux capture-pane` spin whose output drifts
+        # by one line runs for hours unseen; this one judges the command shape instead.
+        polling_trip = observe_tool_command(self, tool_name, function_args)
+        if polling_trip is not None:
+            function_result = (function_result or "") + "\n\n" + polling_trip.message
         return function_result
 
     def _stall_guards_enabled(self) -> bool:
