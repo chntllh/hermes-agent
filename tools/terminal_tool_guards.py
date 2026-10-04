@@ -289,3 +289,84 @@ def self_repo_block(
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
+
+
+# ``refs/stash`` is a single ref per REPOSITORY, shared by every linked worktree of it.
+# Two agents working in sibling worktrees therefore share one stash stack: agent 1
+# stashes, agent 2 pops, and agent 1's uncommitted work is silently gone. There is no
+# per-worktree stash to switch to, so the operation is refused outright in that topology.
+_GIT_STASH = re.compile(r"\bgit\b[^;&|\n]*?\bstash\b(?P<rest>[^;&|\n]*)")
+# Reads cannot take another worktree's work; everything else can create, move or destroy
+# entries on the shared stack.
+_READ_ONLY_STASH_SUBCOMMANDS = frozenset({"list", "show"})
+
+GIT_STASH_REJECTION = (
+    "CRITICAL: git stash is repository-global and forbidden in worktrees. refs/stash is "
+    "one ref shared by every linked worktree of this repository, so a stash here lands on "
+    "the same stack a sibling agent pops from -- and whichever agent pops first takes the "
+    "other's uncommitted work. Use an atomic commit instead: "
+    "`git commit -am 'wip: <what you were doing>'`, which is private to this branch and "
+    "can be amended or reset later. To inspect the shared stack read-only, "
+    "`git stash list` and `git stash show` are still allowed."
+)
+
+
+def detect_forbidden_git_stash(command: str) -> bool:
+    """True when ``command`` runs a git stash subcommand that mutates the shared stack."""
+    for match in _GIT_STASH.finditer(command or ""):
+        words = match.group("rest").strip().split()
+        subcommand = words[0] if words and not words[0].startswith("-") else ""
+        if subcommand not in _READ_ONLY_STASH_SUBCOMMANDS:
+            return True
+    return False
+
+
+def _in_linked_worktree(cwd: str) -> bool:
+    """Whether ``cwd`` sits in a linked worktree (``--git-dir`` differs from
+    ``--git-common-dir``). That difference IS the hazard: it means this repository has
+    more than one checkout, and therefore more than one agent able to reach refs/stash.
+    Unknown (not a repo, git missing, probe failed) reads as False — a guard that cannot
+    see the topology must not block ordinary work."""
+    import subprocess
+
+    from hermes_cli._subprocess_compat import noninteractive_git_env, windows_hide_flags
+
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, check=False, env=noninteractive_git_env(),
+            creationflags=windows_hide_flags(),
+        )
+    except Exception:
+        logger.debug("git worktree topology probe failed in %s", cwd, exc_info=True)
+        return False
+    if probe.returncode != 0:
+        return False
+    lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+    return len(lines) == 2 and lines[0] != lines[1]
+
+
+def worktree_stash_block(
+    *,
+    command: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+) -> Optional[str]:
+    """Refuse a mutating ``git stash`` issued from inside a linked git worktree.
+
+    Ordered cheap-first: the regex runs on every command, the git probe only on the
+    handful that mention stash at all. Returns the JSON error string when blocked,
+    else None.
+    """
+    if not detect_forbidden_git_stash(command):
+        return None
+    from tools.terminal_tool import _resolve_command_cwd
+
+    guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
+    if not _in_linked_worktree(str(guard_cwd)):
+        return None
+    logger.warning("Blocked git stash in a linked worktree (command: %s)",
+                   _safe_command_preview(command))
+    return _blocked_json(GIT_STASH_REJECTION, "blocked")

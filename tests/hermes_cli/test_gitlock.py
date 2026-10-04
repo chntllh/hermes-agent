@@ -61,15 +61,15 @@ def no_git_running(monkeypatch: pytest.MonkeyPatch) -> None:
 
     The removal tests exercise the sweep itself, not the guard.  Without
     this pin they are flaky on CI: the parallel per-file test runner is
-    almost always running a real ``git`` subprocess somewhere, the
-    ``pgrep -x git`` probe hits, and the sweep (correctly) refuses to
-    remove anything — failing the assertion for reasons unrelated to the
-    code under test.  The guard's own behavior is pinned separately in
+    almost always running a real ``git`` subprocess somewhere.  The probe is
+    repo-scoped now, so an unrelated ``git`` no longer blocks this sweep — but
+    the runner's git may well be running in a checkout that IS this repo's,
+    so the pin stays.  The guard's own behavior is pinned separately in
     :func:`test_clear_skips_sweep_while_git_running`.
     """
     import hermes_cli.gitlock as gitlock
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: False)
+    monkeypatch.setattr(gitlock, "_running_git_cwds", lambda: [])
 
 
 def test_clear_removes_stale_shallow_lock(repo: Path, no_git_running: None) -> None:
@@ -89,10 +89,14 @@ def test_clear_removes_all_stale_lock_kinds(repo: Path, no_git_running: None) ->
 
 
 def test_clear_skips_sweep_while_git_running(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A running git process must block the sweep even for stale locks."""
+    """A git process working in THIS repo must block the sweep even for stale locks.
+
+    (The complementary case — a git process in some other repo no longer starving this
+    sweep — is pinned in tests/hermes_cli/test_worktree_concurrency.py.)
+    """
     import hermes_cli.gitlock as gitlock
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: True)
+    monkeypatch.setattr(gitlock, "_running_git_cwds", lambda: [repo])
     _touch(repo / ".git" / "shallow.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
     removed = clear_stale_git_locks(repo)
     assert removed == []

@@ -40,33 +40,96 @@ LOCK_NAMES = ("shallow.lock", "index.lock", "HEAD.lock", "MERGE_HEAD.lock")
 _TMP_PACK_PREFIXES = ("tmp_pack_", "tmp_idx_", "tmp_rev_", "tmp_mtimes_", ".tmp-")
 
 
-def _git_proc_running() -> bool:
-    """True when a ``git`` process is running — the check that stops us yanking a lock a live fetch holds.
+_GIT_PROCESS_NAMES = frozenset({"git", "git.exe"})
 
-    A failed probe logs and returns False; the age floor in the sweep still applies.
+
+def _running_git_cwds() -> List[Optional[Path]]:
+    """Working directory of every live ``git`` process; ``None`` for one we cannot read.
+
+    Replaces a global "is any git running anywhere?" probe. That answer starved the
+    stale-lock sweep on EVERY repository whenever a single background fetch touched an
+    unrelated one, so debris accumulated on busy hosts precisely where it was worst.
+
+    A cwd we cannot read (AccessDenied, process already gone) is reported as ``None``
+    rather than dropped, so the caller can stay conservative about it: narrowing the
+    probe must never turn into yanking a lock from a live fetch we merely could not see.
     """
     try:
-        # One shared spawn for both probes: the argv is the platform fork, the
-        # hide-flags wiring is common, so a console-less parent (pythonw backend)
-        # never flashes a console for either (#117781).
-        argv = (["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"]
-                if os.name == "nt" else ["pgrep", "-x", "git"])
-        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=10, creationflags=windows_hide_flags())
-        if os.name == "nt":
-            return "git.exe" in proc.stdout.lower()
-        return proc.returncode == 0
+        import psutil
     except Exception:
-        logger.debug("git process probe failed; assuming no git running", exc_info=True)
+        logger.debug("psutil unavailable; cannot scope the git-process probe", exc_info=True)
+        return [None]  # unscopeable -> every repo treats it as possibly its own
+    found: List[Optional[Path]] = []
+    try:
+        processes = list(psutil.process_iter(["name"]))
+    except Exception:
+        logger.debug("git process scan failed", exc_info=True)
+        return [None]
+    for proc in processes:
+        try:
+            name = (proc.info.get("name") or "").lower()
+        except Exception:
+            continue
+        if name not in _GIT_PROCESS_NAMES:
+            continue
+        try:
+            found.append(Path(proc.cwd()))
+        except Exception:
+            found.append(None)
+    return found
+
+
+def _repo_common_dir(path: Path) -> Optional[Path]:
+    """Absolute shared git dir for ``path``, or None when it is not a git repo.
+
+    Every linked worktree of one repository resolves to the SAME value, which is exactly
+    why this is the scoping key: worktrees share an object store and a lock namespace, so
+    a fetch in one of them must protect the locks of all of them.
+    """
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, env=noninteractive_git_env(), creationflags=windows_hide_flags(),
+        )
+    except Exception:
+        logger.debug("git-common-dir probe failed for %s", path, exc_info=True)
+        return None
+    out = probe.stdout.strip()
+    if probe.returncode != 0 or not out:
+        return None
+    try:
+        return Path(out).resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _git_proc_in_repo(repo_root: Path) -> bool:
+    """True when a live git process may be operating on ``repo_root``'s object store."""
+    cwds = _running_git_cwds()
+    if not cwds:
         return False
+    repo_common = _repo_common_dir(repo_root)
+    for cwd in cwds:
+        if cwd is None:
+            return True  # unattributable: assume it could be ours
+        try:
+            if cwd == repo_root or cwd.is_relative_to(repo_root):
+                return True
+        except (OSError, ValueError):
+            return True
+        if repo_common is not None and _repo_common_dir(cwd) == repo_common:
+            return True
+    return False
 
 
-def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, min_age_seconds: Optional[int],
+def _sweep_stale(repo_root: Path, directory: Path, candidates: Callable[[], Iterable[Path]], *,
+                 min_age_seconds: Optional[int],
                  default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None]) -> List[str]:
     """Shared guard + age-floor sweep. Never raises; skips anything it cannot stat/unlink."""
     if not directory.is_dir():
         return []
-    if _git_proc_running():
+    if _git_proc_in_repo(repo_root):
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
@@ -95,14 +158,15 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
 def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
     """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
 
-    Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
-    stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
+    Removes only when older than the age floor AND no git process is working on THIS repository (or any
+    worktree sharing its object store). Never raises: a lock we cannot stat/unlink is skipped (it may have
+    been re-created between the age check and the unlink; skipping is safe).
     """
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(
-        git_dir, lambda: [git_dir / name for name in LOCK_NAMES],
+        repo_root, git_dir, lambda: [git_dir / name for name in LOCK_NAMES],
         min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
-        skip_msg="git process running; skipping stale-lock sweep",
+        skip_msg="git process active in this repo; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
     )
 
@@ -222,9 +286,9 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
             return []
 
     return _sweep_stale(
-        pack_dir, _candidates,
+        repo_root, pack_dir, _candidates,
         min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS,
-        skip_msg="git process running; skipping tmp-pack sweep",
+        skip_msg="git process active in this repo; skipping tmp-pack sweep",
         log_removed=lambda p, size: logger.info("Removed aborted-fetch pack debris %s (%d bytes)", p, size),
     )
 

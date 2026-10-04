@@ -419,22 +419,25 @@ def test_gitlock_git_spawns_hide_console_window(monkeypatch, tmp_path):
         assert kwargs.get("creationflags") == _CREATE_NO_WINDOW, cmd
 
 
-def test_gitlock_tasklist_probe_hides_console_window(monkeypatch):
-    """The stale-lock tasklist guard flashes on its own under pythonw."""
+def test_gitlock_repo_scope_probe_hides_console_window(monkeypatch, tmp_path):
+    """The stale-lock guard's repo-scoping probe flashes on its own under pythonw.
+
+    (It replaced a ``tasklist``/``pgrep`` spawn that asked the far broader question
+    "is any git running anywhere?"; the console-hiding requirement carries over.)
+    """
     from hermes_cli import gitlock
 
     captured = []
 
     def fake_run(cmd, **kwargs):
         captured.append((list(cmd), kwargs))
-        return _Completed(stdout="\"git.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"\n", returncode=0)
+        return _Completed(stdout=str(tmp_path / ".git") + "\n", returncode=0)
 
     monkeypatch.setattr(gitlock, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(gitlock.subprocess, "run", fake_run)
-    monkeypatch.setattr(gitlock.os, "name", "nt")
 
-    assert gitlock._git_proc_running() is True
-    spawns = _spawns(captured, "tasklist")
+    assert gitlock._repo_common_dir(tmp_path) == (tmp_path / ".git")
+    spawns = _spawns(captured, "git")
     assert len(spawns) == 1, captured
     assert spawns[0][1]["creationflags"] == _CREATE_NO_WINDOW
 

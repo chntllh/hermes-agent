@@ -242,6 +242,26 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+# Auto-generated worktree branches are FLAT (``wt-<id>``), never ``wt/<id>``. Git stores
+# refs as files, so ``refs/heads/wt`` (a file) and ``refs/heads/wt/<id>`` (a directory)
+# cannot coexist: a D/F conflict that is fatal in ref storage and fails every sibling
+# worktree on the board. The slash form is still RECOGNIZED so boards created before the
+# rename are still torn down.
+AUTO_BRANCH_PREFIX = "wt-"
+_LEGACY_AUTO_BRANCH_PREFIX = "wt/"
+
+
+def auto_branch_name(task_id: str) -> str:
+    """The branch Hermes generates for a task with no explicit ``branch_name``."""
+    return f"{AUTO_BRANCH_PREFIX}{task_id}"
+
+
+def is_auto_branch(branch: str) -> bool:
+    """Whether Hermes generated ``branch`` — and may therefore delete it at teardown.
+    A custom branch the operator named is never removed."""
+    return bool(branch) and branch.startswith((AUTO_BRANCH_PREFIX, _LEGACY_AUTO_BRANCH_PREFIX))
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
@@ -249,7 +269,7 @@ def _cleanup_worktree_workspace(
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
+    it. The auto-generated ``wt-<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
@@ -308,9 +328,17 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            _git(repo_root, "branch", "-D", branch, timeout=30)
+        branch = (branch_name or "").strip()
+        # With no recorded branch the name has to be reconstructed, and a card created
+        # before the flat-naming change still has ``wt/<id>`` on disk; try both spellings
+        # so the rename does not strand a branch per legacy task. ``git branch -D`` on a
+        # name that does not exist is a harmless no-op (this whole block is best-effort).
+        candidates = [branch] if branch else [
+            auto_branch_name(task_id), f"{_LEGACY_AUTO_BRANCH_PREFIX}{task_id}",
+        ]
+        for candidate in candidates:
+            if is_auto_branch(candidate):
+                _git(repo_root, "branch", "-D", candidate, timeout=30)
     except Exception:
         pass  # best-effort — never block completion
 
@@ -506,6 +534,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
+        # TOCTOU: the probe above said the branch was absent, but a sibling worker on
+        # another board created it in the window before the add. Git exits 255 with
+        # "already exists" and the whole dispatch used to die. The branch the race
+        # created is the branch we wanted, so check it out instead of creating it.
+        if "-b" in args and "already exists" in stderr.lower():
+            result = _git(repo_root, "worktree", "add", str(target), branch_name, timeout=60)
+            if result.returncode == 0:
+                return
+            stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
@@ -524,7 +561,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or auto_branch_name(task.id)
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
