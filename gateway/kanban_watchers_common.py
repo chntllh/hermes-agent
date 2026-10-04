@@ -97,17 +97,29 @@ def _gc_retention_days() -> int:
         return 30
 
 
-def _kanban_dispatch_allowed() -> bool:
-    """False while the global emergency stop (`hermes pause`) is engaged.
+def _kanban_dispatch_allowed(governor: Any = None) -> bool:
+    """False while spawning is held back — by `hermes pause` or by the storm breaker.
 
     Checked every tick before spawning, so a pause applies on the next tick;
     in-flight workers are never touched. Fails open if estop is unimportable.
+
+    *governor* is the attention governor when one is enabled on this gateway. Its
+    cluster breaker trips when several distinct tasks hit transient upstream failures
+    at once, and spawning into a provider outage just burns worker slots on work that
+    will fail the same way (spec §7.2). Backoff is exponential and self-clearing, so
+    nothing here needs an operator to undo it.
     """
     try:
         from agent.estop import check_paused
     except ImportError:
-        return True
-    return not check_paused("kanban", logger)
+        pass
+    else:
+        if check_paused("kanban", logger):
+            return False
+    if governor is not None and not governor.dispatch_allowed():
+        logger.info("kanban dispatcher: storm breaker is open; holding spawns this tick")
+        return False
+    return True
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":

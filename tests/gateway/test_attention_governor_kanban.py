@@ -397,3 +397,21 @@ def test_a_wake_only_subscription_is_never_governed(board, monkeypatch):
     governor = runner._kanban_governor
     assert governor.decision_queue.queue == {}
     assert governor.outbound_discord_digests == []
+
+
+def test_the_storm_breaker_holds_dispatcher_spawns(board):
+    """§7.2: spawning into a provider outage burns worker slots on doomed work."""
+    from gateway.attention_governor import BlockKind, EventKind, KanbanTaskEvent
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    governor = build_governor({"attention_governor": {"enabled": True}})
+
+    assert _kanban_dispatch_allowed(governor) is True
+    assert _kanban_dispatch_allowed(None) is True
+
+    for i in range(3):
+        governor.ingest_event(KanbanTaskEvent(
+            task_id=f"W-{i}", board_slug="k", kind=EventKind.BLOCKED,
+            block_kind=BlockKind.TRANSIENT, title="w", status="blocked"))
+
+    assert _kanban_dispatch_allowed(governor) is False
