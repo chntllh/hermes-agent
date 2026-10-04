@@ -1,6 +1,6 @@
-"""Stability dampers: per-task flap hysteresis and the cluster-wide storm breaker.
+"""Stability dampers: flap hysteresis, the cluster storm breaker and the replay ledger.
 
-Both are pure sliding-window counters over an injected clock so the governor's
+The two counters are pure sliding windows over an injected clock so the governor's
 decisions stay reproducible in tests and across a restart-free long run.
 """
 
@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hermes.attention_governor")
 
@@ -88,3 +89,28 @@ class SwarmStormBreaker:
 
     def is_tripped(self, now: Optional[float] = None) -> bool:
         return (time.time() if now is None else now) < self.tripped_until
+
+
+class ReplayLedger:
+    """Bounded "already counted" set for at-least-once event sources.
+
+    The Kanban notifier rewinds its cursor whenever a send or wake fails, so the
+    next tick re-offers the same ``task_events`` rows. Counting them twice would
+    manufacture flaps and storms out of one real incident. Bounded because a
+    long-lived gateway must not accumulate an id per event forever; the oldest
+    keys fall out well after their claim could still be replayed.
+    """
+
+    def __init__(self, capacity: int = 4096) -> None:
+        self.capacity = capacity
+        self._seen: "OrderedDict[Any, None]" = OrderedDict()
+
+    def add_if_new(self, key: Any) -> bool:
+        """True when *key* had not been seen (and is now recorded)."""
+        if key in self._seen:
+            self._seen.move_to_end(key)
+            return False
+        self._seen[key] = None
+        while len(self._seen) > self.capacity:
+            self._seen.popitem(last=False)
+        return True

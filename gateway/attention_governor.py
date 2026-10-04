@@ -24,7 +24,7 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from gateway.attention_governor_breakers import FlapDetector, SwarmStormBreaker
+from gateway.attention_governor_breakers import FlapDetector, ReplayLedger, SwarmStormBreaker
 from gateway.attention_governor_focus import (
     CachedFocusSensor,
     DEFAULT_FOCUS_TTL_SECONDS,
@@ -55,6 +55,7 @@ __all__ = [
     "FlapDetector",
     "KanbanTaskEvent",
     "LinearDecisionQueue",
+    "ReplayLedger",
     "NotificationTier",
     "PERSONAL_MODE",
     "SwarmStormBreaker",
@@ -102,7 +103,10 @@ class AttentionGovernor:
         self.p0_cooldown_seconds = p0_cooldown_seconds
         self.digest_batch_size = digest_batch_size
         self.digest_interval_seconds = digest_interval_seconds
-        self._digest_flushed_at = 0.0
+        # Seeded to construction time, not 0: the interval is measured from the last
+        # flush, and an epoch-zero baseline makes the very first digest overdue, so a
+        # single routine event would post its own rollup — the batching this exists for.
+        self._digest_flushed_at = time.time()
 
         # Transport-decoupled outboxes: the governor decides, a transport drains.
         self.outbound_discord_pings: List[Dict[str, Any]] = []
@@ -111,6 +115,11 @@ class AttentionGovernor:
         self.outbound_totonou_captures: List[Dict[str, Any]] = []
         self.circuit_tripped_tasks: Set[str] = set()
         self.displayed_card_task_id: Optional[str] = None
+        #: At-least-once sources replay; see :class:`ReplayLedger`.
+        self.event_ledger = ReplayLedger()
+        #: §5.1A the durable "single card" message id per destination, so the next
+        #: contender edits the card in place instead of posting a second one.
+        self.card_message_ids: Dict[str, str] = {}
 
     # --- classification -------------------------------------------------------------
 
@@ -161,6 +170,19 @@ class AttentionGovernor:
             self._handle_p2(event, now)
         return tier
 
+    def ingest_once(
+        self, event: KanbanTaskEvent, *, key: Any, now: Optional[float] = None,
+    ) -> Optional[NotificationTier]:
+        """:meth:`ingest_event` guarded by the replay ledger; ``None`` when *key* repeats.
+
+        An at-least-once event source (the notifier rewinds its cursor on any send or
+        wake failure) must not inflate the flap and storm counters on retry.
+        """
+        if not self.event_ledger.add_if_new(key):
+            logger.debug("attention governor: ignoring replayed event %s", key)
+            return None
+        return self.ingest_event(event, now=now)
+
     def _apply_flap_hysteresis(self, event: KanbanTaskEvent, now: float) -> None:
         """§7.1: rewrite a flapping task's event into one triage notice, in place."""
         if event.kind not in _FLAPPABLE_KINDS:
@@ -185,6 +207,7 @@ class AttentionGovernor:
             "board": event.board_slug,
             "timestamp": now,
             "flags": 4096,
+            "delivery": event.delivery,
             "message": f"Cluster backoff active: transient failure on {event.task_id} suppressed",
         })
         return True
@@ -246,6 +269,7 @@ class AttentionGovernor:
             "board": event.board_slug,
             "timestamp": now,
             "flags": 4096,
+            "delivery": event.delivery,
             "message": f"Work task {event.task_id} held while the operator is in personal mode",
         })
 
@@ -289,6 +313,7 @@ class AttentionGovernor:
             "kind": event.kind.value,
             "status": event.status,
             "flags": 4096,
+            "delivery": event.delivery,
             "timestamp": now,
         })
 
@@ -350,6 +375,23 @@ class AttentionGovernor:
         return next_card
 
     # --- dispatcher / digest consumers ----------------------------------------------
+
+    def refresh_focus(self, now: Optional[float] = None) -> TotonouFocusState:
+        """Per-tick housekeeping: re-probe focus, expire leases, reopen the slot.
+
+        Called by the transport loop rather than by ingestion: the gate that holds a
+        card open is the *operator's* state changing, which no board event announces.
+        """
+        sensor_refresh = getattr(self.totonou_client, "refresh", None)
+        state = sensor_refresh() if callable(sensor_refresh) else self._focus_state()
+        self.decision_queue.check_timeouts(now=now)
+        self._refresh_active_decision_card(state)
+        return state
+
+    def drain_rendered_cards(self) -> List[Dict[str, Any]]:
+        """Hand every card rendered since the last drain to the transport."""
+        cards, self.outbound_discord_cards = self.outbound_discord_cards, []
+        return cards
 
     def dispatch_allowed(self, now: Optional[float] = None) -> bool:
         """§7.2: False while the storm breaker holds new worker spawns back."""

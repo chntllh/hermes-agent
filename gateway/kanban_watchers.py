@@ -92,6 +92,12 @@ class GatewayKanbanWatchersMixin:
         notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
         self._kanban_notifier_profile = notifier_profile
 
+        # Built once per watcher: the governor is stateful (decision queue, breakers,
+        # focus cache) and rebuilding it each tick would reset every hysteresis window.
+        from gateway.attention_governor_ingest import build_governor, flush_governor
+
+        self._kanban_governor = build_governor(kanban_cfg)
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -116,6 +122,9 @@ class GatewayKanbanWatchersMixin:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()
+                # After the deliveries: a card whose gate is already open reaches the
+                # operator on the same tick, and a held one on the tick its gate opens.
+                await flush_governor(self, _Platform)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)

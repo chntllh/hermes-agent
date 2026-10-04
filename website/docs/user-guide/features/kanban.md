@@ -834,6 +834,53 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `attention_governor.enabled` | `false` | Route notifier deliveries through the Attention Governor instead of pinging once per terminal event. See [Attention Governor](#attention-governor). |
+
+#### Attention Governor
+
+With several agents working at once, one notification per terminal event is alert
+fatigue — and a channel you mute is a human-in-the-loop gate that no longer works.
+Enabled, the notifier stops pinging per event and sorts every board transition into
+three tiers:
+
+- **P0 — interrupt.** A direct mention, rate-limited to one per `p0_cooldown_seconds`.
+  Only infrastructure invariants qualify (host panic, sandbox breach, total swarm
+  deadlock); **no board event can produce one**, so an agent cannot escalate itself by
+  writing "CRITICAL" into a summary.
+- **P1 — review queue.** Review requests, `needs_input` / `capability` blocks, retry
+  exhaustion and root-epic completions. **One** decision card is shown at a time
+  (updated in place as you work through the queue); the rest wait in score order
+  — static priority, how many cards wait downstream, time waited, and whether the card
+  is pinning a worktree. A card unanswered for `hitl_lease_seconds` auto-defers so a
+  worker slot is released instead of starving the board overnight.
+- **P2 — silent digest.** Lane moves, transient and dependency blocks, in-budget
+  crashes and timeouts, and subtask completions. Batched into one silent rollup every
+  `digest_interval_seconds` or `digest_batch_size` events.
+
+Two swarm-stability dampers run alongside: a task bouncing through failure states more
+than twice in 60s is damped to one triage notice, and three or more distinct tasks
+hitting transient failures within 30s trips a cluster breaker that pauses spawns with
+exponential backoff and suppresses the individual alerts.
+
+Waking the origin agent is **not** gated — that is board plumbing, not your attention,
+and holding it would deadlock the swarm.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `attention_governor.operator_id` | `""` | Platform user id mentioned by a P0 interrupt. Empty never mentions anyone. |
+| `attention_governor.focus_poll_seconds` | `30` | Seconds between focus-state probes. |
+| `attention_governor.hitl_lease_seconds` | `2700` | A review card unanswered for this long auto-defers. |
+| `attention_governor.p0_cooldown_seconds` | `900` | Minimum seconds between audible P0 mentions; further emergencies stay visible but silent. |
+| `attention_governor.digest_batch_size` | `25` | Events buffered before the silent digest posts. |
+| `attention_governor.digest_interval_seconds` | `7200` | Maximum seconds the silent digest waits before posting. |
+
+**Focus-state gating is opt-in and injected.** P1 cards are held while an external
+focus engine reports an active session, and work cards are held entirely while it
+reports `personal` mode. Hermes ships the resolver
+(`gateway.attention_governor_focus.resolve_totonou_focus`), which probes each mode
+separately because the upstream API is mode-scoped; wiring a concrete client is left to
+the deployment. With no client configured the governor treats you as always reachable,
+so nothing is ever buffered indefinitely.
 
 And the two auxiliary LLM slots:
 

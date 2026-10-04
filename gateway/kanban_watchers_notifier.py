@@ -234,6 +234,10 @@ class _Collector:
         self.gc_retention_days = gc_retention_days
         self.deliveries: list[dict] = []
         self.include_unowned = runner._owns_kanban_dispatcher_lock()
+        # §6.1 scores a review by how much of the DAG waits on it, and a completion's
+        # tier depends on whether the card is a decomposition leaf. Both need the
+        # task's direct graph, so load it only when a governor will consume it.
+        self.governor = getattr(runner, "_kanban_governor", None)
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
         self.notifier_profiles = {notifier_profile}
         self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
@@ -320,7 +324,18 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "board": slug, "graph": self._graph_for(conn, sub["task_id"])}
+
+    def _graph_for(self, conn: Any, task_id: str) -> Optional[dict]:
+        """Direct parent/child state for the governor, or None when it is disabled."""
+        if self.governor is None:
+            return None
+        try:
+            return self.kb.task_graph_context(conn, task_id)
+        except Exception as exc:
+            logger.debug("kanban notifier: graph context for %s unavailable: %s", task_id, exc)
+            return None
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -505,6 +520,8 @@ class _KanbanNotification:
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.board_slug = d.get("board")
+        self.governor = getattr(runner, "_kanban_governor", None)
+        self.graph = d.get("graph")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
@@ -709,10 +726,43 @@ class _KanbanNotification:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
         return True
 
+    def _governor_claim(self, ev: Any) -> Any:
+        """Offer one event to the attention governor; DECLINED when it is not enabled.
+
+        A governor failure must never swallow a notification, so any error falls back
+        to the historical direct ping.
+        """
+        from gateway.attention_governor_ingest import DECLINED, claim_event, delivery_route
+
+        if self.governor is None:
+            return DECLINED
+        try:
+            return claim_event(
+                self.governor, ev, task=self.task, board_slug=self.board_slug,
+                graph=self.graph, delivery=delivery_route(self.sub, self.board_slug),
+            )
+        except Exception as exc:
+            logger.warning("kanban notifier: attention governor rejected %s event for %s (%s); "
+                           "delivering directly", ev.kind, self.task_id, exc)
+            return DECLINED
+
     async def _send_pings(self) -> bool:
-        """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        """Send every text ping; False when a send failed (claim already rewound/dropped).
+
+        With the attention governor enabled this sends only what the governor hands
+        back as an interrupt: everything else leaves here silently, owned by the
+        governor's decision queue or its digest, and reaches the operator from
+        ``flush_governor`` on this or a later tick. The wake path is deliberately
+        NOT gated — waking the origin agent is swarm plumbing, not human attention,
+        and stalling it behind a focus session would deadlock the board.
+        """
+        from gateway.attention_governor import NotificationTier
+
         for ev in self.d["events"]:
             msg = self.format_event(ev)
+            claim = self._governor_claim(ev)
+            if claim.owned and claim.tier is not NotificationTier.P0_INTERRUPT:
+                continue
             if msg is None:
                 continue
             # Non-push adapters (api_server) always report SendResult(success=False)

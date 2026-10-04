@@ -1950,6 +1950,28 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # Attention Governor: with a swarm of agents, one notification per terminal event is
+        # alert fatigue, and a muted channel makes every human-in-the-loop gate non-functional.
+        # Enabled, the notifier stops pinging per event and routes them into three tiers:
+        # one update-in-place review card at a time, a batched silent digest for routine
+        # telemetry, and a direct mention only for infrastructure emergencies. Disabled (the
+        # default) leaves notifier delivery exactly as it was.
+        "attention_governor": {
+            "enabled": False,
+            # Platform user id mentioned by a P0 interrupt; "" never mentions anyone.
+            "operator_id": "",
+            # Seconds between Totonou focus probes (the Focus Shield gate).
+            "focus_poll_seconds": 30,
+            # A review card unacknowledged for this long auto-defers so a waiting worker
+            # slot is released instead of starving the swarm overnight.
+            "hitl_lease_seconds": 2700,
+            # Minimum seconds between audible P0 mentions; further emergencies stay visible
+            # but silent, coalescing into the active incident.
+            "p0_cooldown_seconds": 900,
+            # The silent digest flushes on whichever of these comes first.
+            "digest_batch_size": 25,
+            "digest_interval_seconds": 7200,
+        },
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
