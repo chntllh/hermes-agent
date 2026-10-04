@@ -831,6 +831,11 @@ _LATER_TASK_COLUMNS = (
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
+    # Local completion gate (opt-in): a shell command that must exit 0 in the card's
+    # workspace, and a JSON array of workspace-relative paths that must exist non-empty.
+    # The local counterpart of completion_contract's GitHub acceptance.
+    ("verification_command", "verification_command TEXT"),
+    ("expected_artifacts", "expected_artifacts TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),

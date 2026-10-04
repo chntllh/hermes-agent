@@ -57,6 +57,18 @@ def _row_get(row: Any, col: str, default: Any = None) -> Any:
     return row[col]
 
 
+def _artifact_list(value: Any) -> Optional[list]:
+    """Normalize a declared artifact list: a list of non-empty strings, or None.
+
+    ``None`` and ``[]`` both mean "undeclared" so an empty list can never read as a
+    satisfied gate (the whole point is that an undeclared card keeps the old path).
+    """
+    if not isinstance(value, list):
+        return None
+    cleaned = [str(item).strip() for item in value if str(item).strip()]
+    return cleaned or None
+
+
 def _json_or(value: Any, default: Any = None) -> Any:
     """Decode a JSON text column; any decode failure or empty value yields ``default``."""
     if not value:
@@ -810,6 +822,9 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Local completion gate; see TaskVerificationFailedError and _gate_local_verification.
+    verification_command: Optional[str] = None
+    expected_artifacts: Optional[list] = None   # None = undeclared; never []
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -825,6 +840,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            expected_artifacts=_artifact_list(_json_or(g("expected_artifacts"))),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -840,6 +856,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "verification_command",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1338,6 +1355,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    verification_command: Optional[str] = None,
+    expected_artifacts: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1358,6 +1377,10 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    # Normalized at the door so "" / [] round-trip as "undeclared" rather than as an
+    # empty gate that every completion trivially satisfies.
+    verification_command = (verification_command or "").strip() or None
+    expected_artifacts = _artifact_list(list(expected_artifacts) if expected_artifacts else None)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1437,8 +1460,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        verification_command, expected_artifacts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1448,6 +1472,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        verification_command,
+                        json.dumps(expected_artifacts) if expected_artifacts is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -2767,6 +2793,21 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class TaskVerificationFailedError(ValueError):
+    """``complete_task`` refused: the card's own machine-checkable claim did not hold.
+
+    Either its ``verification_command`` exited non-zero (or could not be run), or a
+    declared ``expected_artifacts`` entry is missing, empty, or not a regular file
+    inside the workspace. A ``ValueError`` so tool error handlers treat it as
+    recoverable: the fix is to make the claim true and complete again.
+    """
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(f"completion blocked: {task_id} failed verification: {reason}")
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2805,6 +2846,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    verification_timeout: Optional[int] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2818,6 +2860,9 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    A card declaring ``verification_command`` / ``expected_artifacts`` must satisfy
+    them first (:func:`_gate_local_verification`, :class:`TaskVerificationFailedError`);
+    review approval is NOT exempt from that one.
     Completions from non-review statuses need evidence: a stripped ``result``
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
@@ -2829,6 +2874,7 @@ def complete_task(
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    _gate_local_verification(conn, task_id, timeout=verification_timeout)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -2931,6 +2977,115 @@ def _gate_created_cards(
             )
         raise HallucinatedCardsError(phantom_cards, task_id)
     return verified_cards
+
+
+# A verification command is the card's own build/test step, not a probe: give it room
+# to actually compile or run a suite, but never let it wedge the completion path.
+DEFAULT_VERIFICATION_TIMEOUT_SECONDS = 120
+
+
+def _verification_workspace(row) -> Path:
+    """The directory a declared gate is evaluated in; raises when it is unusable."""
+    raw = (row["workspace_path"] or "").strip() if row["workspace_path"] else ""
+    if not raw:
+        raise ValueError(
+            "the card declares a verification gate but has no workspace_path to "
+            "evaluate it in"
+        )
+    workspace = Path(raw).expanduser()
+    if not workspace.is_dir():
+        raise ValueError(f"workspace {raw} does not exist (or is not a directory)")
+    return workspace
+
+
+def _run_verification_command(command: str, workspace: Path, timeout: int) -> None:
+    """Run the card's verification command in its workspace; raise on anything but exit 0."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=str(workspace), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(
+            f"verification command timed out after {timeout}s: {_first_line(command, 200)}"
+        ) from None
+    except OSError as exc:
+        # Fail CLOSED: a command we could not launch is not a command that passed.
+        raise ValueError(f"verification command could not be run: {exc}") from None
+    if result.returncode != 0:
+        tail = _first_line((result.stderr or result.stdout or "").strip()[-400:], 400)
+        raise ValueError(
+            f"verification command failed with exit code {result.returncode}"
+            + (f": {tail}" if tail else "")
+        )
+
+
+def _check_expected_artifacts(artifacts: list, workspace: Path) -> None:
+    """Every declared artifact must be a non-empty regular file inside the workspace."""
+    root = workspace.resolve(strict=False)
+    for artifact in artifacts:
+        candidate = (workspace / artifact).expanduser()
+        resolved = candidate.resolve(strict=False)
+        # An artifact outside the workspace is a file the card did not necessarily
+        # produce; satisfying a gate with someone else's output defeats the gate.
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(f"expected artifact {artifact!r} resolves outside the workspace")
+        if not resolved.exists():
+            raise ValueError(f"expected artifact missing: {artifact}")
+        if not resolved.is_file():
+            raise ValueError(f"expected artifact {artifact!r} is not a regular file")
+        if resolved.stat().st_size == 0:
+            raise ValueError(f"expected artifact is empty: {artifact}")
+
+
+def _gate_local_verification(
+    conn: sqlite3.Connection, task_id: str, *, timeout: Optional[int] = None,
+) -> None:
+    """Refuse a completion whose own machine-checkable claim does not hold.
+
+    The local counterpart of ``kanban_pr_acceptance``'s GitHub gate. Opt-in: a card
+    declaring neither field is untouched, which is the documented rollback. Runs
+    BEFORE the write transaction (it spawns a subprocess; holding SQLite's write lock
+    across a build would block every other worker on the board) and before the prose
+    check, so a red build is reported as a red build rather than as thin evidence.
+    Review approvals are NOT exempt: a human vouching for a card is still not evidence
+    that its test suite passes.
+    """
+    row = conn.execute(
+        "SELECT verification_command, expected_artifacts, workspace_path "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    command = (row["verification_command"] or "").strip()
+    artifacts = _artifact_list(_json_or(row["expected_artifacts"]))
+    if not command and not artifacts:
+        return
+    try:
+        workspace = _verification_workspace(row)
+        if command:
+            _run_verification_command(
+                command, workspace,
+                int(timeout if timeout is not None else DEFAULT_VERIFICATION_TIMEOUT_SECONDS),
+            )
+        if artifacts:
+            _check_expected_artifacts(artifacts, workspace)
+    except ValueError as exc:
+        reason = str(exc)
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_verification",
+                {
+                    "reason": reason,
+                    "verification_command": _first_line(command, 200) or None,
+                    "expected_artifacts": artifacts,
+                },
+            )
+        raise TaskVerificationFailedError(task_id, reason) from None
 
 
 def _substantive_text(value: Optional[str]) -> bool:

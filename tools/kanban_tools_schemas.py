@@ -507,6 +507,19 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "verification_command": _prop("string", (
+            "Shell command that proves this card is done, run in its workspace at completion; "
+            "a non-zero exit refuses the completion. Declare the check you would run by hand "
+            "(a test suite, a build, a linter) so 'done' is measured, not asserted."
+        )),
+        "expected_artifacts": {
+            "type": "array", "items": {"type": "string"},
+            "description": (
+                "Workspace-relative paths this card must leave behind. Each must exist as a "
+                "non-empty file at completion or the completion is refused. Paths outside the "
+                "workspace are rejected."
+            ),
+        },
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "

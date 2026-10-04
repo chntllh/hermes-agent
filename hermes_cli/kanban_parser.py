@@ -205,6 +205,14 @@ _SPECS = [
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+        _arg("--verify-with", metavar="COMMAND", dest="verification_command",
+             help="Shell command that proves the card is done, run in its workspace at "
+                  "completion; a non-zero exit refuses the completion. The local "
+                  "counterpart of --completion-contract's CI gate."),
+        _arg("--expect-artifact", metavar="PATH", dest="expected_artifacts",
+             action="append",
+             help="Workspace-relative path the card must leave behind as a non-empty "
+                  "file; completion is refused otherwise. Repeatable."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
