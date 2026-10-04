@@ -80,6 +80,31 @@ def test_default_config_ships_the_governor_disabled():
     assert DEFAULT_CONFIG["kanban"]["attention_governor"]["enabled"] is False
 
 
+def test_the_shipped_settings_are_exactly_the_ones_the_reader_consumes(tmp_path, monkeypatch):
+    """A key only one side knows about is a setting that silently does nothing."""
+    from gateway.attention_governor_ingest import SETTING_KEYS
+    from hermes_cli.config import load_config
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    section = (load_config().get("kanban") or {}).get("attention_governor")
+
+    assert set(section) == set(SETTING_KEYS)
+    # And the shipped values survive the parser rather than falling back to its own.
+    resolved = governor_settings({"attention_governor": section})
+    assert resolved.hitl_lease_seconds == float(section["hitl_lease_seconds"])
+    assert resolved.digest_batch_size == int(section["digest_batch_size"])
+
+
+def test_a_typo_in_a_setting_name_is_reported_not_swallowed(caplog):
+    governor_settings({"attention_governor": {"enabled": True, "hitl_lease_secs": 60}})
+
+    assert "hitl_lease_secs" in caplog.text
+
+
 # --- translation ---------------------------------------------------------------------
 
 
@@ -350,3 +375,25 @@ def test_a_held_review_reaches_the_operator_as_one_card_not_n_pings(board, monke
     # Arrival order wins a free slot: scoring breaks ties among items that are WAITING,
     # it never yanks the card the operator is already looking at.
     assert active.title == "Feature 0"
+
+
+def test_a_wake_only_subscription_is_never_governed(board, monkeypatch):
+    """`delivery_mode="wake"` asked for no passive surface; a card would be one."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="Wake only", assignee="worker", initial_status="running")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                           delivery_mode="wake")
+        assert kb.request_review(conn, tid, summary="ready")
+    finally:
+        conn.close()
+
+    runner, adapter = _run_notifier(monkeypatch, {
+        "notify_in_gateway": True,
+        "attention_governor": {"enabled": True, "operator_id": "123"},
+    })
+
+    assert adapter.sent == []
+    governor = runner._kanban_governor
+    assert governor.decision_queue.queue == {}
+    assert governor.outbound_discord_digests == []

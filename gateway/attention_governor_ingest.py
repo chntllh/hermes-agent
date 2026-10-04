@@ -12,6 +12,7 @@ event can mint a P0.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -75,6 +76,20 @@ class GovernorSettings:
     digest_interval_seconds: float = DEFAULT_DIGEST_INTERVAL_SECONDS
 
 
+#: Every key :func:`governor_settings` consumes. ``DEFAULT_CONFIG`` must declare exactly
+#: these: a key only one side knows about is a setting that silently does nothing, which
+#: is how ``gateway.auto_migrate`` shipped against a guard reading another spelling.
+SETTING_KEYS = (
+    "enabled",
+    "operator_id",
+    "focus_poll_seconds",
+    "hitl_lease_seconds",
+    "p0_cooldown_seconds",
+    "digest_batch_size",
+    "digest_interval_seconds",
+)
+
+
 def _number(cfg: Mapping, key: str, default: float) -> float:
     try:
         value = float(cfg.get(key, default))
@@ -90,6 +105,11 @@ def governor_settings(kanban_cfg: Optional[Mapping]) -> GovernorSettings:
     section = (kanban_cfg or {}).get(SETTINGS_KEY)
     if not isinstance(section, Mapping):
         return GovernorSettings()
+    unknown = sorted(set(section) - set(SETTING_KEYS))
+    if unknown:
+        # A typo'd setting that silently does nothing is worse than a loud one.
+        logger.warning("attention governor: ignoring unknown kanban.%s key(s): %s",
+                       SETTINGS_KEY, ", ".join(unknown))
     operator = section.get("operator_id")
     return GovernorSettings(
         enabled=bool(section.get("enabled", False)),
@@ -295,7 +315,7 @@ async def _send_to_route(runner: Any, route: Mapping, text: str, platform_cls: A
     than re-posted; adapters without edit support answer ``success=False`` and we
     send anew, which is the documented contract.
     """
-    from gateway.kanban_watchers_notifier import _adapter_for_subscription
+    from gateway.kanban_watchers_notifier import _adapter_for_subscription, owner_scope
 
     try:
         platform = platform_cls(route.get("platform"))
@@ -303,7 +323,10 @@ async def _send_to_route(runner: Any, route: Mapping, text: str, platform_cls: A
         logger.debug("attention governor: unknown platform %r; dropping render", route.get("platform"))
         return None
     sub = route.get("sub") or {}
-    adapter = _adapter_for_subscription(runner, platform, sub, route.get("profile"))
+    # The route recheck reads the served profile's session store for a stateless
+    # destination, so it runs off the event loop like the notifier's own recheck.
+    adapter = await asyncio.to_thread(
+        _adapter_for_subscription, runner, platform, sub, route.get("profile"))
     if adapter is None:
         logger.debug("attention governor: no adapter for %s; render deferred", _route_key(route))
         return None
@@ -317,11 +340,14 @@ async def _send_to_route(runner: Any, route: Mapping, text: str, platform_cls: A
         metadata["suppress_notifications"] = True
         metadata["flags"] = 4096
 
-    if message_id:
-        edited = await adapter.edit_message(route["chat_id"], message_id, text)
-        if getattr(edited, "success", False):
-            return getattr(edited, "message_id", None) or message_id
-    result = await adapter.send(route["chat_id"], text, metadata=metadata)
+    # Rendering reads the SUBSCRIBER profile's config (language, media policy), while
+    # this loop runs in the launch profile's scope.
+    async with owner_scope(runner, platform, route.get("chat_id"), route.get("profile")):
+        if message_id:
+            edited = await adapter.edit_message(route["chat_id"], message_id, text)
+            if getattr(edited, "success", False):
+                return getattr(edited, "message_id", None) or message_id
+        result = await adapter.send(route["chat_id"], text, metadata=metadata)
     if getattr(result, "success", True) is False:
         logger.warning("attention governor: send to %s failed: %s",
                        _route_key(route), getattr(result, "error", None))

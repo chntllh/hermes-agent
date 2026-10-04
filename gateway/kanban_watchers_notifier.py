@@ -115,6 +115,35 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return str(resolved) if resolved else None
 
 
+def served_profile(runner: Any, sub_profile: Optional[str]) -> Optional[str]:
+    """*sub_profile* when THIS gateway is a multiplexer serving it, else ``None``.
+
+    ``None`` means "no scope switch": a standalone ``hermes -p <name>`` gateway is
+    already running in its own profile's scope.
+    """
+    if not sub_profile:
+        return None
+    if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return None
+    return sub_profile
+
+
+def owner_scope(runner: Any, platform: Any, chat_id: Any, sub_profile: Optional[str]):
+    """Runtime scope of a subscription's profile under multiplex, else a no-op context.
+
+    Everything sent on a subscription's behalf — pings, artifacts, the wake text and
+    the attention governor's cards — reads the SUBSCRIBER profile's config, while the
+    notifier thread itself runs in the launch profile's scope.
+    """
+    profile = served_profile(runner, sub_profile)
+    if not profile:
+        return contextlib.nullcontext()
+    from gateway.run import _async_profile_runtime_scope
+    from gateway.session import SessionSource
+    source = SessionSource(platform=platform, chat_id=chat_id, profile=profile)
+    return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
+
+
 _ANCHORLESS_WARNED: set[tuple] = set()
 
 
@@ -629,22 +658,11 @@ class _KanbanNotification:
         ``None`` keeps the historical path: a standalone ``hermes -p <name>`` gateway owns its own
         listener and key, so its api_server wakes keep using the HTTP self-post.
         """
-        if not self.sub_profile:
-            return None
-        if not getattr(getattr(self.runner, "config", None), "multiplex_profiles", False):
-            return None
-        return self.sub_profile
+        return served_profile(self.runner, self.sub_profile)
 
     def _owner_scope(self):
         """Runtime scope of the subscription's profile under multiplex, else a no-op context."""
-        runner = self.runner
-        served_profile = self._served_wake_profile()
-        if not served_profile:
-            return contextlib.nullcontext()
-        from gateway.run import _async_profile_runtime_scope
-        from gateway.session import SessionSource
-        source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=served_profile)
-        return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
+        return owner_scope(self.runner, self.plat, self.sub["chat_id"], self.sub_profile)
 
     async def wake(self) -> None:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
@@ -734,7 +752,11 @@ class _KanbanNotification:
         """
         from gateway.attention_governor_ingest import DECLINED, claim_event, delivery_route
 
-        if self.governor is None:
+        # Only events that WOULD have produced a passive ping today are the governor's
+        # to own. A wake-only subscription asked for no passive surface at all, and a
+        # non-push adapter has none to offer — governing either would manufacture a
+        # message the subscriber opted out of or the transport cannot deliver.
+        if self.governor is None or not self.send_passive or not self.is_push_adapter:
             return DECLINED
         try:
             return claim_event(

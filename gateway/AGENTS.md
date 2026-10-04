@@ -88,6 +88,39 @@ or opted-in explicit targets. `all` expansions do not gain home mirror eligibili
 briefs are labelled user turns appended at a turn boundary, preserving role alternation
 (`cron/AGENTS.md`).
 
+## Kanban notifier: the attention governor (opt-in)
+
+`kanban.attention_governor.enabled` (default **false**) swaps the notifier's one-ping-per-
+terminal-event behaviour for three tiers. Off, `_send_pings` is byte-identical to its history;
+keep it that way — the gate is one `claim.owned` check, not a fork of the delivery path.
+
+`attention_governor.py` is the facade; siblings own `_models` (vocabulary), `_focus` (the
+mode-scoped Totonou probe), `_queue` (Attention WIP=1), `_breakers` (flap / storm / replay) and
+`_ingest` (everything that knows about Kanban or a transport). The governor itself imports no
+board and no adapter.
+
+Four invariants a change here must preserve:
+
+- **No board event may mint a P0.** `_KIND_MAP` omits the three infrastructure kinds, and
+  `classify_event` reads only kinds, typed block kinds and infrastructure-written payload flags.
+  Agent prose rides in `summary`/`reason` as display text and is never classified. Adding a
+  tier rule keyed on free text reopens self-escalation (spec §2 T7).
+- **The wake path is not gated.** Waking the origin agent is board plumbing; holding it behind
+  the operator's focus session deadlocks the swarm while they are away. Only the *passive ping*
+  is the governor's, and only for subscriptions that would get one today (`send_passive` and a
+  push adapter — a wake-only sub asked for no passive surface).
+- **Suppression is never loss.** Held, mode-locked and damped events stay addressable: P1s in
+  the decision queue, P2s in the digest. The notifier cursor advances because the governor has
+  taken ownership, not because the event was dropped.
+- **The event source is at-least-once.** Any send or wake failure rewinds the cursor and the
+  batch replays, so every ingest goes through `ReplayLedger`; counting a retry twice
+  manufactures flaps and storms out of one incident.
+
+Focus sensing is injected, not built in: `resolve_totonou_focus(client)` probes `work` and
+`personal` separately (the upstream API is mode-scoped), ORs the shields and resolves the mode
+personal-first. A total probe failure fails **open** — a false "shield clear" costs one
+mention-free card, a false "shield active" swallows every HITL gate until someone notices.
+
 ## `/login` (off-turn, paired DM only)
 
 `/login` is registered in `hermes_cli/commands.py` with `busy_policy="dispatch"` and
