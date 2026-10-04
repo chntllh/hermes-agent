@@ -161,6 +161,35 @@ def test_read_only_and_unrelated_git_commands_pass(command):
     assert detect_forbidden_git_stash(command) is False
 
 
+@pytest.mark.parametrize("command", [
+    "git log --grep=stash",
+    "grep -rn 'git stash' docs/",
+    "echo 'never use git stash'",
+    "python -c \"print('git stash')\"",
+])
+def test_merely_mentioning_stash_is_not_running_it(command):
+    """A guard that blocks `git log --grep=stash` or a grep through the docs costs more
+    than it saves, so detection is tokenized: shlex collapses quoted text into one
+    token, and a mention is never an invocation."""
+    from tools.terminal_tool_guards import detect_forbidden_git_stash
+
+    assert detect_forbidden_git_stash(command) is False
+
+
+def test_git_invoked_by_path_is_still_caught():
+    from tools.terminal_tool_guards import detect_forbidden_git_stash
+
+    assert detect_forbidden_git_stash("/usr/bin/git stash pop") is True
+
+
+def test_an_unparseable_command_falls_back_to_over_blocking():
+    """Unbalanced quotes defeat shlex; a command we cannot parse that still mentions
+    git stash is refused rather than waved through."""
+    from tools.terminal_tool_guards import detect_forbidden_git_stash
+
+    assert detect_forbidden_git_stash("git stash pop 'unterminated") is True
+
+
 def test_stash_is_blocked_inside_a_linked_worktree(repo):
     """Plan acceptance: `git stash` in an agent worktree is rejected with an
     explanation that names the alternative."""

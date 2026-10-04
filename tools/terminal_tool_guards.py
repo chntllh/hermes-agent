@@ -295,10 +295,17 @@ def self_repo_block(
 # Two agents working in sibling worktrees therefore share one stash stack: agent 1
 # stashes, agent 2 pops, and agent 1's uncommitted work is silently gone. There is no
 # per-worktree stash to switch to, so the operation is refused outright in that topology.
-_GIT_STASH = re.compile(r"\bgit\b[^;&|\n]*?\bstash\b(?P<rest>[^;&|\n]*)")
+# Git's own global options, which sit BEFORE the subcommand; those taking a separate
+# value have to be skipped two tokens at a time to find the real subcommand.
+_GIT_GLOBAL_FLAGS_WITH_VALUE = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
+})
 # Reads cannot take another worktree's work; everything else can create, move or destroy
 # entries on the shared stack.
 _READ_ONLY_STASH_SUBCOMMANDS = frozenset({"list", "show"})
+# Loose fallback for a command shlex cannot parse (unbalanced quotes). Over-blocks on
+# purpose: an unparseable command that mentions git stash is worth a second look.
+_GIT_STASH_LOOSE = re.compile(r"\bgit\b[^;&|\n]*?\bstash\b")
 
 GIT_STASH_REJECTION = (
     "CRITICAL: git stash is repository-global and forbidden in worktrees. refs/stash is "
@@ -311,13 +318,51 @@ GIT_STASH_REJECTION = (
 )
 
 
+def _is_git_token(token: str) -> bool:
+    """Whether ``token`` invokes git itself (bare or by path), not merely mentions it."""
+    return token == "git" or token.rsplit("/", 1)[-1] in {"git", "git.exe"}
+
+
+def _git_subcommand_at(tokens: list[str], start: int) -> str:
+    """The subcommand following the ``git`` token at ``start``, skipping global options."""
+    index = start + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _GIT_GLOBAL_FLAGS_WITH_VALUE:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return ""
+
+
 def detect_forbidden_git_stash(command: str) -> bool:
-    """True when ``command`` runs a git stash subcommand that mutates the shared stack."""
-    for match in _GIT_STASH.finditer(command or ""):
-        words = match.group("rest").strip().split()
-        subcommand = words[0] if words and not words[0].startswith("-") else ""
-        if subcommand not in _READ_ONLY_STASH_SUBCOMMANDS:
-            return True
+    """True when ``command`` runs a git stash subcommand that mutates the shared stack.
+
+    Tokenized rather than pattern-matched: a regex over the raw string blocks
+    ``git log --grep=stash`` and ``grep -rn 'git stash' docs/``, which are ordinary work.
+    shlex collapses quoted text into single tokens, so a mention is not an invocation.
+    """
+    if not command or "stash" not in command:
+        return False
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return bool(_GIT_STASH_LOOSE.search(command))
+    for index, token in enumerate(tokens):
+        if not _is_git_token(token):
+            continue
+        if _git_subcommand_at(tokens, index) == "stash":
+            words = tokens[index + 1:]
+            # The token after ``stash`` is its own subcommand (``pop``, ``list``, ...);
+            # a bare ``git stash`` is ``push`` and mutates.
+            position = words.index("stash") + 1 if "stash" in words else len(words)
+            rest = words[position:]
+            subcommand = rest[0] if rest and not rest[0].startswith("-") else ""
+            if subcommand not in _READ_ONLY_STASH_SUBCOMMANDS:
+                return True
     return False
 
 
