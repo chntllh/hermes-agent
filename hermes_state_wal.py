@@ -28,7 +28,16 @@ logger = logging.getLogger("hermes_state")
 # "not authorized": some FUSE mounts block the WAL pragma outright.
 _WAL_INCOMPAT_MARKERS = ("locking protocol", "not authorized", "disk i/o error")
 # SQLite's default journal_size_limit is -1 (unlimited); see _apply_wal_size_limit.
-_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 64 MiB
+# 16 MiB: a live state.db-wal was measured at 157 MB, and retention was the half of
+# that the checkpoint could not undo — a checkpointed WAL is reused in place, never
+# truncated, so the file keeps the high-water mark of the largest transaction ever.
+_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16 MiB
+# SQLite's own default is 1000 pages, but it is a compile-time default that differs
+# between bundled, distro and Homebrew builds. Setting it explicitly makes the
+# checkpoint cadence an observable property of the connection rather than of the
+# library someone happened to link. ``database.wal_autocheckpoint`` in config.yaml
+# still overrides it (apply_database_pragmas runs after this).
+_WAL_AUTOCHECKPOINT_PAGES = 1000
 
 # Once-per-process-per-db_label dedup sets (kanban_db.connect() runs on every kanban operation, so an undeduped
 # line would repeat per connection). Tests clear these via ``hermes_state_wal.<name>``.
@@ -121,9 +130,18 @@ def _enforce_macos_synchronous_full(conn: sqlite3.Connection) -> None:
     _darwin_pragma(conn, "PRAGMA synchronous=FULL")
 
 
+def _apply_wal_autocheckpoint(conn: sqlite3.Connection) -> None:
+    """Pin the automatic checkpoint cadence. Best-effort: failure only costs disk slack."""
+    try:
+        conn.execute(f"PRAGMA wal_autocheckpoint={_WAL_AUTOCHECKPOINT_PAGES}")
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+        logger.debug("wal_autocheckpoint not applied: %s", exc)
+
+
 def _apply_wal_companions(conn: sqlite3.Connection) -> None:
-    """The settings every WAL activation carries: size limit + macOS barriers."""
+    """The settings every WAL activation carries: size limit + checkpoint cadence + macOS barriers."""
     _apply_wal_size_limit(conn)
+    _apply_wal_autocheckpoint(conn)
     _apply_macos_checkpoint_barrier(conn)
     _enforce_macos_synchronous_full(conn)
 

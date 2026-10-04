@@ -448,6 +448,30 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
 # one-shots, recovery flows, and read-only cross-profile opens use SessionDB() directly with their own close().
 
 
+def _finalize_read_transaction(conn: sqlite3.Connection, db_path) -> None:
+    """End any read transaction still open on a pooled connection before it is reused.
+
+    A WAL reader holds its snapshot — and blocks every checkpoint past it — for as long
+    as its read transaction lives. Ordinary reads here use temporary cursors that
+    refcounting finalizes, so they pin nothing; an EXPLICIT ``BEGIN`` handed out to a
+    caller (``hermes_state_timeline._snapshot`` streams one for a whole request) lives
+    until that caller rolls it back. When the caller is abandoned mid-request the
+    connection returns to the pool still inside its transaction, and the WAL stops
+    advancing: a live ``state.db-wal`` reached 157 MB pinned at frame 384 of 39,699.
+
+    Rolling back here costs one attribute read on the common path and leaves the
+    connection healthy for the next borrower. Best-effort: a connection we cannot
+    finalize is still better pooled than leaked.
+    """
+    try:
+        if not conn.in_transaction:
+            return
+        conn.rollback()
+        logger.debug("rolled back a read transaction left open on a pooled reader for %s", db_path)
+    except sqlite3.Error:
+        logger.debug("could not finalize a pooled read connection for %s", db_path, exc_info=True)
+
+
 class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
@@ -919,6 +943,7 @@ class SessionDB(
             try:
                 yield conn
             finally:
+                _finalize_read_transaction(conn, self.db_path)
                 returned = False
                 with self._read_conns_lock:
                     if not self._read_conns_closed:
